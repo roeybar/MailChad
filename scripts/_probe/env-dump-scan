@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# bin/_probe/env-dump-scan
+# Adversarial probe: docker inspect each container's env, verify against
+# an allowlist for that component.
+# STUB: needs the actual allowlist per component.
+set -euo pipefail
+echo "  - env-dump-scan: STUB (allowlist per component TBD)"
+exit 0

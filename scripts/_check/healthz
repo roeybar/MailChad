@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# bin/_check/healthz
+# Hit /healthz on every running container.
+set -euo pipefail
+
+probe() {
+  local container="$1" port="$2" label="$3"
+  if ! docker ps --filter "name=^${container}$" --format '{{.Names}}' | grep -q .; then
+    echo "  - $label: not running, skip"
+    return 0
+  fi
+  if docker exec "$container" curl -sf "http://localhost:${port}/healthz" >/dev/null 2>&1; then
+    echo "  ✓ $label: healthz ok"
+    return 0
+  fi
+  echo "  ✗ $label: healthz failed"
+  return 1
+}
+
+rc=0
+probe ep-v3-front-edge 8443 "front-edge" || rc=1
+probe ep-v3-vault      8000 "vault"      || rc=1
+probe ep-v3-backup     8001 "backup"     || rc=1
+exit $rc

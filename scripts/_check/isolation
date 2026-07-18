@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# bin/_check/isolation
+# Verify vault + backup have ZERO internet egress.
+# Exit 0 if isolated (good), non-zero if breached (bad).
+set -euo pipefail
+
+check_no_egress() {
+  local container="$1"
+  local label="$2"
+  if ! docker ps --filter "name=^${container}$" --format '{{.Names}}' | grep -q .; then
+    echo "  - $label: not running, skip"
+    return 0
+  fi
+  # Try reaching 1.1.1.1 - should fail (no route to internet)
+  if docker exec "$container" sh -c 'curl --max-time 3 -sf https://1.1.1.1 >/dev/null 2>&1'; then
+    echo "  ✗ $label: REACHED 1.1.1.1 - isolation breach!"
+    return 1
+  fi
+  # Try resolving api.resend.com - should fail
+  if docker exec "$container" sh -c 'getent hosts api.resend.com >/dev/null 2>&1'; then
+    echo "  ✗ $label: resolved api.resend.com - DNS leak!"
+    return 1
+  fi
+  echo "  ✓ $label: isolated"
+  return 0
+}
+
+rc=0
+check_no_egress ep-v3-vault   "vault"   || rc=1
+check_no_egress ep-v3-backup  "backup"  || rc=1
+exit $rc

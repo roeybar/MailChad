@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# bin/_check/egress
+# Verify front-edge CAN reach the internet (it must - it's the sender).
+# Inverse of `isolation` for the front-edge container.
+set -euo pipefail
+
+container=ep-v3-front-edge
+if ! docker ps --filter "name=^${container}$" --format '{{.Names}}' | grep -q .; then
+  echo "  - front-edge not running; cannot verify egress"
+  exit 1
+fi
+if docker exec "$container" sh -c 'curl --max-time 5 -sf https://api.resend.com >/dev/null 2>&1 || curl --max-time 5 -sf https://1.1.1.1 >/dev/null 2>&1'; then
+  echo "  ✓ front-edge: internet reachable"
+  exit 0
+fi
+echo "  ✗ front-edge: cannot reach internet (broken egress)"
+exit 1

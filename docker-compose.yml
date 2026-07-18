@@ -1,0 +1,38 @@
+# email-platform v3.19 - terminal-only production config.
+#
+# Cloud infrastructure runs on AWS Lambda (ep-api + ep-dispatcher).
+# This compose file starts only the terminal container, which connects
+# to the real Lambda via CLOUD_URL from .env.
+#
+# Local dev (full stack): bin/v3 up-dev
+# Production (Lambda):    bin/v3 up          ← default
+
+services:
+  terminal:
+    container_name: ep-v3-terminal
+    build:
+      context: .
+      dockerfile: deploy/terminal.Dockerfile
+    env_file:
+      - .env
+    environment:
+      - SERVICE_ROLE=terminal
+      - TERMINAL_ACTOR=${TERMINAL_ACTOR:-operator}
+      - CLOUD_URL=${CLOUD_URL}
+      - VAULT_DB_PATH=/var/lib/terminal/state.sqlite
+      - BACKUP_PASSPHRASE=${BACKUP_PASSPHRASE:-}
+      - TERMINAL_WG_PRIVATE_KEY=             # blank = skip WireGuard in prod
+      - CLOUD_WG_PUBLIC_KEY=                 # blank = skip WireGuard in prod
+    ports:
+      - "8011:8000"
+    volumes:
+      - terminal-data:/var/lib/terminal
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun
+    restart: unless-stopped
+
+volumes:
+  terminal-data:

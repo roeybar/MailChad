@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# bin/v3 - operator wrapper for email-platform v3.2 (Lambda + DynamoDB architecture).
+#
+# Verbs:
+#   bin/v3 up                Start cloud + dispatcher + terminal locally (dev mode)
+#   bin/v3 up-cloud          Start cloud only
+#   bin/v3 up-terminal       Start terminal only
+#   bin/v3 down              Stop everything
+#   bin/v3 bounce            Restart (keeps volumes)
+#   bin/v3 logs [svc]        Tail logs (cloud|ep-v3-dispatcher|terminal)
+#   bin/v3 shell <svc>       Interactive shell
+#   bin/v3 ps                List containers
+#   bin/v3 init-handshake    One-time setup: generate keypairs, exchange with cloud
+#   bin/v3 backup            One-click backup of terminal state
+#   bin/v3 check <name>      Run a health/consistency check (`all`)
+#   bin/v3 probe <name>      Run an adversarial leak probe
+#   bin/v3 admin-bcrypt      Generate bcrypt hash for ADMIN_PASSWORD_HASH
+#   bin/v3 setup-tables      Create DynamoDB table + SQS queue (local or prod AWS)
+#   bin/v3 deploy-api        Package + deploy ep-api Lambda to AWS
+#   bin/v3 deploy-dispatcher Package + deploy ep-dispatcher Lambda to AWS
+#   bin/v3 tail-api          Tail ep-api CloudWatch logs
+#   bin/v3 tail-dispatcher   Tail ep-dispatcher CloudWatch logs
+#   bin/v3 help
+
+set -euo pipefail
+PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJECT_ROOT"
+
+ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+fail() { printf '  \033[31m✗\033[0m %s\n' "$*" >&2; }
+info() { printf '  \033[34m->\033[0m %s\n' "$*"; }
+
+cmd_up()          { docker compose up -d; ok "terminal :8011 -> Lambda (real AWS)"; }
+cmd_up_dev()      { docker compose -f docker-compose.dev.yml up -d; ok "full local stack (localstack + cloud + dispatcher + terminal)"; }
+cmd_up_cloud()    { docker compose -f docker-compose.dev.yml up -d cloud; ok "local cloud on :8443"; }
+cmd_up_terminal() { docker compose up -d terminal; ok "terminal on localhost:8011"; }
+cmd_down()        { docker compose down; docker compose -f docker-compose.dev.yml down 2>/dev/null; ok "everything down"; }
+cmd_bounce()      { cmd_down >/dev/null 2>&1 || true; cmd_up; }
+cmd_logs()        { docker compose logs -f --tail=200 "${1:-cloud}"; }
+cmd_shell()       {
+  local svc="${1:-}"
+  [ -n "$svc" ] || { echo "usage: bin/v3 shell <cloud|terminal|ep-v3-dispatcher>"; return 2; }
+  docker compose exec "$svc" bash
+}
+cmd_ps() { docker compose ps -a; }
+
+cmd_init_handshake() {
+  if [ "$#" -lt 3 ]; then
+    echo "Usage:"
+    echo "  bin/v3 init-handshake --role <operator|client> \\"
+    echo "                        --cloud <URL> \\"
+    echo "                        --bootstrap-token <TOKEN>"
+    echo ""
+    echo "  --cloud  Prod: API Gateway URL from 'bin/v3 deploy-api' output,"
+    echo "           e.g. https://<id>.execute-api.us-east-1.amazonaws.com"
+    echo "           Dev: http://cloud:8443"
+    echo ""
+    echo "Run ONCE during a screen-share session with the other party."
+    echo "BOOTSTRAP_TOKEN must be set on the cloud before running."
+    return 2
+  fi
+  if ! docker image inspect email-platform-v3-terminal >/dev/null 2>&1; then
+    echo "[init-handshake] building terminal image first..."
+    docker compose build terminal >/dev/null
+  fi
+  docker run --rm -it \
+    -v "$PROJECT_ROOT/bin/_init_handshake.py:/handshake.py:ro" \
+    -v "email-platform-v3_terminal-data:/var/lib/terminal" \
+    --network host \
+    email-platform-v3-terminal python /handshake.py "$@"
+}
+
+cmd_backup() {
+  if ! docker image inspect email-platform-v3-terminal >/dev/null 2>&1; then
+    echo "[backup] building terminal image..."
+    docker compose build terminal >/dev/null
+  fi
+  mkdir -p "$PROJECT_ROOT/backups"
+  docker run --rm -it \
+    -v "$PROJECT_ROOT/bin/_backup.py:/backup.py:ro" \
+    -v "email-platform-v3_terminal-data:/var/lib/terminal" \
+    -v "$PROJECT_ROOT/backups:/work/backups" \
+    -e TERMINAL_ACTOR="${TERMINAL_ACTOR:-operator}" \
+    email-platform-v3-terminal python /backup.py "$@"
+}
+
+cmd_check() {
+  local name="${1:-}"
+  if [ -z "$name" ] || [ "$name" = "all" ]; then
+    local rc=0
+    for f in bin/_check/*; do
+      [ -x "$f" ] || continue
+      "$f" >/dev/null 2>&1 && ok "$(basename "$f")" || { fail "$(basename "$f")"; rc=1; }
+    done
+    return $rc
+  fi
+  exec bin/_check/"$name" "$@"
+}
+
+cmd_probe() {
+  local name="${1:-}"
+  [ -n "$name" ] || { ls bin/_probe/; return 2; }
+  exec bin/_probe/"$name" "${@:2}"
+}
+
+cmd_admin_bcrypt() {
+  if ! docker image inspect email-platform-v3-terminal >/dev/null 2>&1; then
+    docker compose build terminal >/dev/null
+  fi
+  if [ -t 0 ]; then
+    printf "Password (hidden): " >&2
+    stty -echo; read pw; echo >&2; stty echo
+  else
+    read pw
+  fi
+  [ -n "$pw" ] || { echo "empty"; exit 1; }
+  printf '%s' "$pw" | docker run --rm -i email-platform-v3-terminal python -c "
+import sys, bcrypt
+pw = sys.stdin.read().rstrip('\n').encode()
+print(bcrypt.hashpw(pw, bcrypt.gensalt(rounds=12)).decode())
+"
+}
+
+# Infrastructure setup
+
+cmd_setup_tables() {
+  # Create DynamoDB table + SQS queue (+ DLQ). Idempotent.
+  # With DYNAMODB_ENDPOINT/SQS_ENDPOINT in .env -> hits local containers.
+  # Without -> hits real AWS (needs valid creds in .env).
+  if ! docker image inspect email-platform-v3-cloud >/dev/null 2>&1; then
+    docker compose build cloud >/dev/null
+  fi
+  local env_args=()
+  [ -f "$PROJECT_ROOT/.env" ] && env_args+=(--env-file "$PROJECT_ROOT/.env")
+  docker run --rm \
+    "${env_args[@]}" \
+    -v "$PROJECT_ROOT/deploy/setup_tables.py:/setup_tables.py:ro" \
+    -e AWS_DEFAULT_REGION="${AWS_REGION:-us-east-1}" \
+    email-platform-v3-cloud \
+    python /setup_tables.py
+}
+
+# Lambda deployment
+
+_require_env() {
+  local var="$1"
+  if [ -z "${!var:-}" ]; then
+    # Try .env file
+    local val
+    val=$(grep -E "^${var}=" "$PROJECT_ROOT/.env" 2>/dev/null | cut -d= -f2- | tr -d "'" | head -1)
+    if [ -z "$val" ]; then
+      fail "${var} not set - add to .env before deploying"
+      exit 1
+    fi
+    export "${var}=${val}"
+  fi
+}
+
+_build_lambda_zip() {
+  local zip_name="$1"   # e.g. ep-api.zip
+  local extra_entry="$2"  # extra file to include at root (e.g. dispatcher_lambda.py)
+  local zip_path="$PROJECT_ROOT/deploy/${zip_name}"
+
+  info "Building ${zip_name} inside cloud image..."
+  if ! docker image inspect email-platform-v3-cloud >/dev/null 2>&1; then
+    docker compose build cloud >/dev/null
+  fi
+
+  # Install lambda deps into /tmp/pkg, then zip code on top using Python zipfile
+  docker run --rm \
+    -v "$PROJECT_ROOT/cloud:/cloud:ro" \
+    -v "$PROJECT_ROOT/deploy:/deploy" \
+    email-platform-v3-cloud bash -c "
+      set -e
+      rm -rf /tmp/lambda-pkg && mkdir /tmp/lambda-pkg
+      pip install -q --root-user-action=ignore --target /tmp/lambda-pkg -r /repo/deploy/requirements-lambda.txt
+      cp -r /repo/src/mailchad /tmp/lambda-pkg/mailchad
+      python3 -c \"
+import zipfile, os, pathlib, sys
+dest = '/deploy/${zip_name}'
+base = pathlib.Path('/tmp/lambda-pkg')
+with zipfile.ZipFile(dest, 'w', zipfile.ZIP_DEFLATED) as z:
+    for f in base.rglob('*'):
+        if f.is_file() and '__pycache__' not in str(f) and '.pyc' not in str(f):
+            z.write(f, f.relative_to(base))
+size_kb = os.path.getsize(dest) // 1024
+print(f'  packaged {size_kb}KB')
+\"
+    "
+  ok "Built ${zip_path}"
+}
+
+_aws_cli() {
+  # Run AWS CLI inside the cloud container (boto3/botocore already there via awscli).
+  # Falls back to host `aws` if available.
+  if command -v aws >/dev/null 2>&1; then
+    aws "$@"
+  else
+    docker run --rm \
+      -e AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}" \
+      -e AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}" \
+      -e AWS_DEFAULT_REGION="${AWS_REGION:-us-east-1}" \
+      amazon/aws-cli "$@"
+  fi
+}
+
+_run_deploy_script() {
+  # Runs deploy/deploy_lambda.py inside the cloud container (boto3 already there).
+  # Mounts deploy/ so the script + zip are visible inside.
+  local target="$1"   # api | dispatcher
+  local zip_name="$2" # ep-api.zip | ep-dispatcher.zip
+  docker run --rm \
+    -v "$PROJECT_ROOT/deploy:/deploy" \
+    -e AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}" \
+    -e AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}" \
+    -e AWS_DEFAULT_REGION="${AWS_REGION:-us-east-1}" \
+    -e DYNAMODB_TABLE="${DYNAMODB_TABLE:-ep-v3-prod}" \
+    -e SQS_QUEUE_URL="${SQS_QUEUE_URL:-}" \
+    -e LAMBDA_ROLE_ARN="${LAMBDA_ROLE_ARN:-}" \
+    -e LAMBDA_DISPATCHER_ROLE_ARN="${LAMBDA_DISPATCHER_ROLE_ARN:-}" \
+    email-platform-v3-cloud \
+    python /deploy/deploy_lambda.py "$target" "/deploy/${zip_name}"
+}
+
+cmd_deploy_api() {
+  _require_env AWS_ACCESS_KEY_ID
+  _require_env AWS_SECRET_ACCESS_KEY
+  _require_env SQS_QUEUE_URL
+  _require_env DYNAMODB_TABLE
+  _require_env LAMBDA_ROLE_ARN
+
+  _build_lambda_zip "ep-api.zip" ""
+  info "Deploying ep-api Lambda..."
+  _run_deploy_script api ep-api.zip
+  ok "ep-api deployed"
+}
+
+cmd_deploy_dispatcher() {
+  _require_env AWS_ACCESS_KEY_ID
+  _require_env AWS_SECRET_ACCESS_KEY
+  _require_env SQS_QUEUE_URL
+  _require_env DYNAMODB_TABLE
+  _require_env LAMBDA_DISPATCHER_ROLE_ARN
+
+  _build_lambda_zip "ep-dispatcher.zip" ""
+  info "Deploying ep-dispatcher Lambda..."
+  _run_deploy_script dispatcher ep-dispatcher.zip
+  ok "ep-dispatcher deployed"
+}
+
+
+# SQS trigger wiring (separate step if first deploy's trigger failed)
+
+cmd_wire_sqs_trigger() {
+  _require_env AWS_ACCESS_KEY_ID
+  _require_env AWS_SECRET_ACCESS_KEY
+  _require_env SQS_QUEUE_URL
+  docker run --rm \
+    -v "$PROJECT_ROOT/deploy:/deploy" \
+    -e AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}" \
+    -e AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}" \
+    -e AWS_DEFAULT_REGION="${AWS_REGION:-us-east-1}" \
+    -e SQS_QUEUE_URL="${SQS_QUEUE_URL}" \
+    email-platform-v3-cloud python3 -c "
+import os, boto3
+region = os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
+sqs = boto3.client('sqs', region_name=region)
+lam = boto3.client('lambda', region_name=region)
+q = sqs.get_queue_attributes(QueueUrl=os.environ['SQS_QUEUE_URL'], AttributeNames=['QueueArn'])
+arn = q['Attributes']['QueueArn']
+# check if mapping already exists
+existing = lam.list_event_source_mappings(FunctionName='ep-dispatcher', EventSourceArn=arn)
+if existing['EventSourceMappings']:
+    print('  SQS trigger already wired:', existing['EventSourceMappings'][0]['UUID'])
+else:
+    m = lam.create_event_source_mapping(FunctionName='ep-dispatcher', EventSourceArn=arn, BatchSize=10)
+    print('  SQS trigger:', m['UUID'])
+"
+  ok "SQS trigger wired"
+}
+
+# CloudWatch log tails
+
+cmd_tail_api() {
+  local region="${AWS_REGION:-us-east-1}"
+  info "Tailing /aws/lambda/ep-api (region=${region}) - Ctrl-C to stop"
+  _aws_cli logs tail "/aws/lambda/ep-api" --follow --region "$region"
+}
+
+cmd_tail_dispatcher() {
+  local region="${AWS_REGION:-us-east-1}"
+  info "Tailing /aws/lambda/ep-dispatcher (region=${region}) - Ctrl-C to stop"
+  _aws_cli logs tail "/aws/lambda/ep-dispatcher" --follow --region "$region"
+}
+
+cmd_help() { sed -n '2,/^$/p' "$0" | sed 's/^# *//'; }
+
+case "${1:-help}" in
+  up)                shift; cmd_up "$@" ;;
+  up-dev)            shift; cmd_up_dev "$@" ;;
+  up-cloud)          shift; cmd_up_cloud "$@" ;;
+  up-terminal)       shift; cmd_up_terminal "$@" ;;
+  down)              shift; cmd_down "$@" ;;
+  bounce)            shift; cmd_bounce "$@" ;;
+  logs)              shift; cmd_logs "$@" ;;
+  shell)             shift; cmd_shell "$@" ;;
+  ps)                shift; cmd_ps "$@" ;;
+  init-handshake)    shift; cmd_init_handshake "$@" ;;
+  backup)            shift; cmd_backup "$@" ;;
+  check)             shift; cmd_check "$@" ;;
+  probe)             shift; cmd_probe "$@" ;;
+  admin-bcrypt)      shift; cmd_admin_bcrypt "$@" ;;
+  setup-tables)      shift; cmd_setup_tables "$@" ;;
+  deploy-api)        shift; cmd_deploy_api "$@" ;;
+  deploy-dispatcher) shift; cmd_deploy_dispatcher "$@" ;;
+  wire-sqs-trigger)  shift; cmd_wire_sqs_trigger "$@" ;;
+  tail-api)          shift; cmd_tail_api "$@" ;;
+  tail-dispatcher)   shift; cmd_tail_dispatcher "$@" ;;
+  help|-h|--help)    cmd_help ;;
+  *) echo "unknown verb: $1"; cmd_help; exit 2 ;;
+esac

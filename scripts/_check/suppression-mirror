@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# bin/_check/suppression-mirror
+# Compare vault's suppression_hashes count + fingerprint to backup's mirror.
+# Both must be awake.
+set -euo pipefail
+
+vault_up=$(docker ps --filter "name=^ep-v3-vault$" --format '{{.Names}}' | grep -c . || true)
+backup_up=$(docker ps --filter "name=^ep-v3-backup$" --format '{{.Names}}' | grep -c . || true)
+
+if [ "$vault_up" = "0" ] || [ "$backup_up" = "0" ]; then
+  echo "  - suppression-mirror: vault or backup sleeping; nothing to compare"
+  exit 0
+fi
+
+vault_resp=$(docker exec ep-v3-vault curl -sf "http://localhost:8000/healthz" 2>/dev/null || echo "")
+vault_count=$(echo "$vault_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('suppression_hashes', '?'))" 2>/dev/null || echo "?")
+
+backup_resp=$(docker exec ep-v3-backup curl -sf "http://localhost:8001/suppression-mirror" 2>/dev/null || echo "")
+backup_count=$(echo "$backup_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('count', '?'))" 2>/dev/null || echo "?")
+
+if [ "$vault_count" = "$backup_count" ]; then
+  echo "  ✓ suppression-mirror: counts match ($vault_count)"
+  exit 0
+fi
+echo "  ✗ suppression-mirror: vault=$vault_count backup=$backup_count - sync required"
+exit 1
