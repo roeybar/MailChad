@@ -1,8 +1,8 @@
-"""Send-time scheduler (v3.22) - the human-simulation engine.
+"""Send-time scheduler (v3.22) - variable-interval, window-bounded.
 
 Compiles a list of N recipients into N `send_at` UTC timestamps spread across
-daily work-hours windows, by `sender_count` parallel simulated senders, with an
-end-of-shift rush (denser sends in the last `rush_tail_minutes`). The terminal
+daily work-hours windows, by `sender_count` parallel send cursors, with an
+end-of-window rush (denser sends in the last `rush_tail_minutes`). The terminal
 emits these on the packs; the cloud dispatcher fires each when due (§4.2). The
 terminal is not involved during sending - the schedule lives entirely in send_at.
 

@@ -1,7 +1,7 @@
 # Send strategy - batched, windowed, seeded
 
-How MailChad paces a campaign. Goal: organic-looking, deliverability-safe, fully
-observable sending, with hard caps so an ESP's limits are never blown.
+How MailChad paces a campaign. Goal: deliverability-safe, fully observable
+sending, with hard caps so an ESP's limits are never blown.
 
 ## The model
 
@@ -18,11 +18,11 @@ never blind.
 starting at `send_window_start_hour` in `send_window_tz` (DST-aware). Outside the
 window, sending pauses and resumes next day. A batch spans as many windows as needed.
 
-**Simulated senders + end-of-shift rush.** `send_sender_count` senders pace with
-human jitter (`send_jitter_min_s`–`send_jitter_max_s`). In the final
-`send_rush_tail_minutes` the jitter collapses toward `send_rush_jitter_s` - a burst to
-clear the queue before end of shift, mirroring real human behaviour and defeating
-fixed-interval detection.
+**Parallel senders + end-of-window rush.** `send_sender_count` send cursors pace
+with randomised intervals (`send_jitter_min_s`–`send_jitter_max_s`). In the final
+`send_rush_tail_minutes` the interval collapses toward `send_rush_jitter_s`, so a
+window's remaining queue drains before the window closes instead of spilling into
+the next day.
 
 **Per-day cap.** `send_daily_cap` bounds sends per calendar window-day; when a day
 fills, all senders roll to the next window. Set this **under your ESP's daily limit**
