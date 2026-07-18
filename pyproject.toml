@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mailchad"
+version = "3.23.0"
+description = "Zero-trust email dispatch platform - the cloud relays but cannot read your mail"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "AGPL-3.0-only" }
+dynamic = ["dependencies"]
+
+[project.urls]
+Homepage = "https://github.com/roeybar/MailChad"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_default_fixture_loop_scope = "function"
+# e2e/backup suites need live infra (AWS, a running terminal); excluded from the
+# default run so `pytest` is green on a fresh clone. Run them explicitly.
+addopts = "--ignore=tests/live_e2e.py --ignore=tests/leakage_e2e.py --ignore=tests/test_backup.py"

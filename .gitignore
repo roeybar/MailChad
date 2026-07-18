@@ -1,0 +1,43 @@
+# Per-project isolation. Host stays clean; everything runs in docker.
+
+.env
+.env.local
+.env.*.local
+
+# Python local artifacts (we shouldn't have any - host stays clean)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local-only notes
+notes/
+
+# Compose state
+docker-compose.override.yml
+
+# WireGuard keys (we generate inside containers; nothing should land here)
+*.key
+*.pubkey
+wg*.conf
+
+# OS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+
+# Local backups during dev
+*.sqlite
+*.db
+backups/
+.ssh/
+deploy/*.zip
+handoff.md
+
+# Defensive: crypto material + restore bundles
+*.bin
+cloud_bearer.txt
+*.7z
+restore-point/
