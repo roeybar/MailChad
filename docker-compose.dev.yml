@@ -1,0 +1,88 @@
+# email-platform v3.19 - full LOCAL dev stack (localstack + dynamodb-local).
+# Use: bin/v3 up-dev
+# Production (real Lambda): bin/v3 up
+
+services:
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    container_name: ep-v3-dynamodb
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    ports:
+      - "127.0.0.1:8001:8000"
+
+  localstack:
+    image: localstack/localstack:3
+    container_name: ep-v3-localstack
+    environment:
+      SERVICES: sqs
+      DEFAULT_REGION: us-east-1
+    ports:
+      - "127.0.0.1:4566:4566"
+
+  cloud:
+    container_name: ep-v3-cloud
+    build: ./cloud
+    env_file: .env
+    environment:
+      - SERVICE_ROLE=cloud
+      - DYNAMODB_ENDPOINT=http://ep-v3-dynamodb:8000
+      - SQS_ENDPOINT=http://ep-v3-localstack:4566
+      - DYNAMODB_TABLE=${DYNAMODB_TABLE:-ep-v3-dev}
+      - SQS_QUEUE_URL=http://ep-v3-localstack:4566/000000000000/ep-send-queue
+      - AWS_DEFAULT_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-local}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-local}
+    ports:
+      - "8443:8443"
+    volumes:
+      - cloud-keys:/var/lib/cloud/keys
+    restart: unless-stopped
+    depends_on:
+      - dynamodb-local
+      - localstack
+
+  ep-v3-dispatcher:
+    container_name: ep-v3-dispatcher
+    build: ./cloud
+    env_file: .env
+    environment:
+      - SERVICE_ROLE=dispatcher
+      - DYNAMODB_ENDPOINT=http://ep-v3-dynamodb:8000
+      - SQS_ENDPOINT=http://ep-v3-localstack:4566
+      - DYNAMODB_TABLE=${DYNAMODB_TABLE:-ep-v3-dev}
+      - SQS_QUEUE_URL=http://ep-v3-localstack:4566/000000000000/ep-send-queue
+      - AWS_DEFAULT_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-local}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-local}
+    command: ["python", "/app/dispatcher_local.py"]
+    volumes:
+      - cloud-keys:/var/lib/cloud/keys
+    restart: unless-stopped
+    depends_on:
+      - dynamodb-local
+      - localstack
+
+  terminal:
+    container_name: ep-v3-terminal
+    build:
+      context: .
+      dockerfile: deploy/terminal.Dockerfile
+    env_file: .env
+    environment:
+      - SERVICE_ROLE=terminal
+      - TERMINAL_ACTOR=${TERMINAL_ACTOR:-operator}
+      - CLOUD_URL=${CLOUD_URL:-http://cloud:8443}
+      - VAULT_DB_PATH=/var/lib/terminal/state.sqlite
+      - BACKUP_PASSPHRASE=${BACKUP_PASSPHRASE:-}
+    ports:
+      - "8011:8000"
+    volumes:
+      - terminal-data:/var/lib/terminal
+    restart: unless-stopped
+    depends_on:
+      - cloud
+      - dynamodb-local
+
+volumes:
+  cloud-keys:
+  terminal-data:
