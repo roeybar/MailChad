@@ -6,7 +6,7 @@ your contacts, templates and encryption keys stay. When you launch a campaign
 your machine encrypts every message before handing it to a cloud relay, which
 passes it on to the email provider and immediately discards it - so even if the
 relay is fully compromised, an attacker gets neither your mail nor your contact
-list. It also paces sending to look like a human rather than a blast, honours
+list. It also paces sending to stay inside provider limits, honours
 unsubscribes and bounces automatically, and runs on AWS's free tier for roughly
 nothing.
 
