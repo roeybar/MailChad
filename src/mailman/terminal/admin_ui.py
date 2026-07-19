@@ -2248,7 +2248,7 @@ def campaigns_view(session=Depends(require_session)):
       <div class="field span-2" style="border-top:1px solid var(--border);padding-top:14px;margin-top:2px">
         <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
           <input type="checkbox" id="chs" name="human_send" value="1" onchange="toggleHuman(this.checked)" style="width:16px;height:16px;accent-color:var(--accent)">
-          <span>Human-send emulator <span class="hint">randomise delay between sends to avoid pattern detection</span></span>
+          <span>Human-send emulator <span class="hint">randomise the delay between sends</span></span>
         </label>
         <div id="human-range" style="display:none;margin-top:12px">
           <div class="form-grid" style="grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:10px">
@@ -2980,11 +2980,11 @@ def sending_settings_view(session=Depends(require_session), ok: str = ""):
     FIELDS = [
         ("send_window_tz", "Window timezone", "IANA tz, e.g. America/Los_Angeles", "America/Los_Angeles"),
         ("send_window_start_hour", "Window start hour (local)", "0–23; 9 = 09:00", "9"),
-        ("send_window_hours", "Window length (hours)", "e.g. 4 -> a 4-hour shift", "4"),
-        ("send_sender_count", "Parallel senders", "simulated humans sending in parallel", "3"),
+        ("send_window_hours", "Window length (hours)", "e.g. 4 -> a 4-hour window", "4"),
+        ("send_sender_count", "Parallel senders", "how many send cursors run in parallel", "3"),
         ("send_jitter_min_s", "Jitter min (sec)", "min gap between a sender's sends", "60"),
         ("send_jitter_max_s", "Jitter max (sec)", "max gap between a sender's sends", "210"),
-        ("send_rush_tail_minutes", "End-of-shift rush (min)", "final minutes senders 'try hard'", "30"),
+        ("send_rush_tail_minutes", "End-of-window rush (min)", "final minutes: gap collapses to drain the queue", "30"),
         ("send_rush_jitter_s", "Rush gap (sec)", "tight gap during the rush", "15"),
         ("send_batch_size", "Batch size", "contacts per batch (manual approve-next)", "1000"),
     ]

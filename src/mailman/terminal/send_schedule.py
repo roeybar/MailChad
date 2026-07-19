@@ -104,7 +104,7 @@ def compute_send_ats(
         emitted += 1
         rush_start = s["close"] - timedelta(minutes=rush_tail_minutes)
         if s["t"] >= rush_start:
-            gap = rush_jitter_s * (0.5 + rng.random())   # end-of-shift rush
+            gap = rush_jitter_s * (0.5 + rng.random())   # end-of-window rush
         else:
             gap = rng.uniform(jitter_min_s, jitter_max_s)
         nxt = s["t"] + timedelta(seconds=gap)
