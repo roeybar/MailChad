@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# bin/_check/drift
+# Call vault's /sync/drift endpoint (read-only). Red if any CRITICAL drift.
+# Vault must be awake.
+set -euo pipefail
+
+if ! docker ps --filter "name=^ep-v3-vault$" --format '{{.Names}}' | grep -q .; then
+  echo "  - drift: vault sleeping; no drift to check (operator wakes vault to run)"
+  exit 0
+fi
+
+resp=$(docker exec ep-v3-vault curl -sf http://localhost:8000/sync/drift?unack_only=true 2>&1)
+if [ -z "$resp" ]; then
+  echo "  ✗ drift: could not reach vault"
+  exit 1
+fi
+
+critical=$(echo "$resp" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+crit = sum(1 for x in d.get('drift', []) if x['severity'] == 'CRITICAL')
+warn = sum(1 for x in d.get('drift', []) if x['severity'] == 'WARN')
+total = len(d.get('drift', []))
+print(f'{crit}|{warn}|{total}')
+")
+crit=$(echo "$critical" | cut -d'|' -f1)
+warn=$(echo "$critical" | cut -d'|' -f2)
+total=$(echo "$critical" | cut -d'|' -f3)
+
+if [ "$crit" -gt 0 ]; then
+  echo "  ✗ drift: $crit CRITICAL + $warn WARN ($total total unacked)"
+  exit 1
+fi
+if [ "$warn" -gt 0 ]; then
+  echo "  ~ drift: 0 CRITICAL but $warn WARN ($total total unacked)"
+  exit 0
+fi
+echo "  ✓ drift: clean ($total unacked entries)"
