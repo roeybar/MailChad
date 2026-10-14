@@ -1,4 +1,4 @@
-"""Terminal-side sync client - short-poll loop + push (spec §3.3 + §13.4).
+"""Terminal-side sync client - short-poll loop + push (spec section 3.2).
 
 Runs as a background asyncio task. Two responsibilities:
 
@@ -9,8 +9,8 @@ Runs as a background asyncio task. Two responsibilities:
      mark outbox rows as sent.
 
 Idempotent + resumable: cursor stored in local DB. Reconnect = replay
-from cursor. Events with revision <= local row's revision no-op (last-
-write-wins via Lamport, §3.2).
+from cursor. An event is skipped only when its exact (table_name, row_id,
+revision) is already in the inbox; older unseen revisions are stored too.
 
 Conflict resolution: never client-side. Cloud detects sub-minute writes
 to same (table, row_id), writes to near_conflict_log. Terminal pulls
@@ -27,8 +27,13 @@ from datetime import datetime, timezone
 from typing import Callable
 
 import httpx
+from sqlalchemy import func, insert, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.orm import aliased
 
 from mailman.terminal import db, encryption
+from mailman.terminal.models import (Campaign, CampaignBatch, CampaignRecipient, CampaignStage, Contact,
+                                      DispatchedJob, DriftReport, InboxRow, OutboxRow, SuppressionHash, SyncState)
 
 log = logging.getLogger("terminal.sync")
 
@@ -38,7 +43,7 @@ TERMINAL_ACTOR = os.environ.get("TERMINAL_ACTOR", "operator")
 
 def _load_bearer() -> str:
     """Resolve CLOUD_BEARER. Env var wins; falls back to KEYS_DIR/cloud_bearer.txt
-    (populated by `bin/v3 init-handshake`)."""
+    (populated by the handshake helper, `scripts/_init_handshake.py`)."""
     env = os.environ.get("CLOUD_BEARER", "").strip()
     if env:
         return env
@@ -64,41 +69,45 @@ def _headers() -> dict:
 # Local sync-state helpers
 
 def _get_cursor() -> int:
-    with db.conn() as c:
-        row = c.execute(
-            "SELECT value FROM sync_state WHERE key = 'last_pulled_event_id'"
-        ).fetchone()
+    with db.session() as s:
+        row = s.execute(
+            select(SyncState.value).where(SyncState.key == "last_pulled_event_id")
+        ).mappings().first()
         return int(row["value"]) if row else 0
 
 
 def _set_cursor(event_id: int) -> None:
-    with db.conn() as c:
-        c.execute(
-            "INSERT INTO sync_state (key, value, updated_at) VALUES "
-            "('last_pulled_event_id', ?, datetime('now')) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')",
-            (str(event_id),),
+    with db.session() as s:
+        stmt = sqlite_insert(SyncState).values(key="last_pulled_event_id", value=str(event_id),
+                                               updated_at=func.datetime("now"))
+        s.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[SyncState.key],
+                set_={"value": stmt.excluded.value, "updated_at": func.datetime("now")},
+            ).execution_options(synchronize_session=False)
         )
-        c.commit()
+        s.commit()
 
 
 def _get_unsub_cursor() -> str:
-    with db.conn() as c:
-        row = c.execute(
-            "SELECT value FROM sync_state WHERE key = 'last_pulled_unsub_at'"
-        ).fetchone()
+    with db.session() as s:
+        row = s.execute(
+            select(SyncState.value).where(SyncState.key == "last_pulled_unsub_at")
+        ).mappings().first()
         return row["value"] if row else ""
 
 
 def _set_unsub_cursor(added_at: str) -> None:
-    with db.conn() as c:
-        c.execute(
-            "INSERT INTO sync_state (key, value, updated_at) VALUES "
-            "('last_pulled_unsub_at', ?, datetime('now')) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')",
-            (added_at,),
+    with db.session() as s:
+        stmt = sqlite_insert(SyncState).values(key="last_pulled_unsub_at", value=added_at,
+                                               updated_at=func.datetime("now"))
+        s.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[SyncState.key],
+                set_={"value": stmt.excluded.value, "updated_at": func.datetime("now")},
+            ).execution_options(synchronize_session=False)
         )
-        c.commit()
+        s.commit()
 
 
 def _merge_unsubs(unsubs: list[dict]) -> int:
@@ -110,7 +119,7 @@ def _merge_unsubs(unsubs: list[dict]) -> int:
     if not unsubs:
         return 0
     applied = 0
-    with db.conn() as c:
+    with db.session() as s:
         for u in unsubs:
             h = u.get("email_hash")
             if not h:
@@ -118,46 +127,49 @@ def _merge_unsubs(unsubs: list[dict]) -> int:
             scope = u.get("scope", "all")
             scope = scope if scope in ("promotional", "all") else "all"
             added_at = u.get("added_at") or None
-            existing = c.execute(
-                "SELECT scope FROM suppression_hashes WHERE email_hash = ?", (h,)
-            ).fetchone()
+            existing = s.execute(
+                select(SuppressionHash.scope).where(SuppressionHash.email_hash == h)
+            ).mappings().first()
             if existing is None:
-                c.execute(
-                    "INSERT INTO suppression_hashes (email_hash, reason, scope, source, added_at) "
-                    "VALUES (?, 'unsubscribe', ?, 'sync:unsub_pull', COALESCE(?, datetime('now')))",
-                    (h, scope, added_at),
+                s.execute(
+                    insert(SuppressionHash).values(email_hash=h, reason="unsubscribe", scope=scope,
+                                                   source="sync:unsub_pull",
+                                                   added_at=func.coalesce(added_at, func.datetime("now")))
+                    .execution_options(synchronize_session=False)
                 )
                 applied += 1
             elif scope == "all" and existing["scope"] != "all":
                 # upgrade promotional -> all
-                c.execute(
-                    "UPDATE suppression_hashes SET scope = 'all' WHERE email_hash = ?", (h,)
+                s.execute(
+                    update(SuppressionHash).where(SuppressionHash.email_hash == h)
+                    .values(scope="all").execution_options(synchronize_session=False)
                 )
                 applied += 1
-        c.commit()
+        s.commit()
     return applied
 
 
 def _drain_outbox() -> list[dict]:
     """Pull rows from local outbox awaiting push. Returns wire-format events."""
-    with db.conn() as c:
-        rows = [dict(r) for r in c.execute(
-            "SELECT outbox_id, table_name, row_id, revision, actor, modified_at, "
-            "key_id, encrypted_payload, deleted "
-            "FROM outbox WHERE pushed_at IS NULL ORDER BY outbox_id LIMIT 200"
-        ).fetchall()]
+    with db.session() as s:
+        rows = [dict(r) for r in s.execute(
+            select(OutboxRow.outbox_id, OutboxRow.table_name, OutboxRow.row_id, OutboxRow.revision,
+                   OutboxRow.actor, OutboxRow.modified_at, OutboxRow.key_id, OutboxRow.encrypted_payload,
+                   OutboxRow.deleted)
+            .where(OutboxRow.pushed_at.is_(None)).order_by(OutboxRow.outbox_id).limit(200)
+        ).mappings().all()]
     return rows
 
 
 def _mark_outbox_pushed(outbox_ids: list[int], assigned_event_ids: list[int]) -> None:
-    with db.conn() as c:
+    with db.session() as s:
         for ob_id, ev_id in zip(outbox_ids, assigned_event_ids):
-            c.execute(
-                "UPDATE outbox SET pushed_at = datetime('now'), assigned_event_id = ? "
-                "WHERE outbox_id = ?",
-                (ev_id, ob_id),
+            s.execute(
+                update(OutboxRow).where(OutboxRow.outbox_id == ob_id)
+                .values(pushed_at=func.datetime("now"), assigned_event_id=ev_id)
+                .execution_options(synchronize_session=False)
             )
-        c.commit()
+        s.commit()
 
 
 # PULL loop
@@ -165,31 +177,30 @@ def _mark_outbox_pushed(outbox_ids: list[int], assigned_event_ids: list[int]) ->
 async def _apply_event(event: dict, bundle: encryption.KeyBundle | None) -> None:
     """Decrypt + apply an event to the local DB. Idempotent.
 
-    Strategy: store the encrypted blob in `inbox` for now; deferred
-    decryption + table-routing is the next layer (admin UI reads inbox
-    when displaying things, OR a separate worker materialises into the
-    real tables - pick once we wire the UI in §13).
+    Store the encrypted blob in `inbox`; the materialiser handles deferred
+    decryption and routing to local tables.
     """
     enc_b64 = event.get("encrypted_payload")
     payload_bytes = base64.b64decode(enc_b64) if enc_b64 else None
-    with db.conn() as c:
+    with db.session() as s:
         # Idempotent insert keyed on (table_name, row_id, revision) - if we've
         # already seen this exact revision, skip.
-        existing = c.execute(
-            "SELECT 1 FROM inbox WHERE table_name = ? AND row_id = ? AND revision = ?",
-            (event["table_name"], event["row_id"], event["revision"]),
-        ).fetchone()
+        existing = s.execute(
+            select(1).select_from(InboxRow)
+            .where(InboxRow.table_name == event["table_name"], InboxRow.row_id == event["row_id"],
+                   InboxRow.revision == event["revision"])
+        ).first()
         if existing:
             return
-        c.execute(
-            "INSERT INTO inbox (event_id, table_name, row_id, revision, actor, "
-            "modified_at, key_id, encrypted_payload, deleted, received_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-            (event["event_id"], event["table_name"], event["row_id"],
-             event["revision"], event["actor"], event["modified_at"],
-             event["key_id"], payload_bytes, 1 if event["deleted"] else 0),
+        s.execute(
+            insert(InboxRow).values(event_id=event["event_id"], table_name=event["table_name"],
+                                    row_id=event["row_id"], revision=event["revision"], actor=event["actor"],
+                                    modified_at=event["modified_at"], key_id=event["key_id"],
+                                    encrypted_payload=payload_bytes, deleted=1 if event["deleted"] else 0,
+                                    received_at=func.datetime("now"))
+            .execution_options(synchronize_session=False)
         )
-        c.commit()
+        s.commit()
 
 
 async def pull_loop(stop: asyncio.Event) -> None:
@@ -233,13 +244,16 @@ async def pull_loop(stop: asyncio.Event) -> None:
                     log.info("merged %d unsub(s) into suppression (cursor -> %s)",
                              n, data.get("max_unsub_at", ""))
             # Mark a successful pull so the lock-confirmer can prove a pull ran post-dispatch
-            with db.conn() as _c:
-                _c.execute(
-                    "INSERT INTO sync_state (key, value, updated_at) VALUES "
-                    "('last_pull_ok_at', datetime('now'), datetime('now')) "
-                    "ON CONFLICT(key) DO UPDATE SET value=datetime('now'), updated_at=datetime('now')"
+            with db.session() as _s:
+                _s.execute(
+                    sqlite_insert(SyncState)
+                    .values(key="last_pull_ok_at", value=func.datetime("now"), updated_at=func.datetime("now"))
+                    .on_conflict_do_update(
+                        index_elements=[SyncState.key],
+                        set_={"value": func.datetime("now"), "updated_at": func.datetime("now")},
+                    ).execution_options(synchronize_session=False)
                 )
-                _c.commit()
+                _s.commit()
             backoff_s = 1.0
         except asyncio.CancelledError:
             raise
@@ -311,62 +325,70 @@ OUTCOMES_INTERVAL_S = int(os.environ.get("OUTCOMES_POLL_INTERVAL_S", "30"))
 
 
 def _get_outcome_cursor() -> str:
-    with db.conn() as c:
-        row = c.execute(
-            "SELECT value FROM sync_state WHERE key = 'last_outcome_enqueued_at'"
-        ).fetchone()
+    with db.session() as s:
+        row = s.execute(
+            select(SyncState.value).where(SyncState.key == "last_outcome_enqueued_at")
+        ).mappings().first()
         return row["value"] if row else ""
 
 
 def _set_outcome_cursor(enqueued_at: str) -> None:
-    with db.conn() as c:
-        c.execute(
-            "INSERT INTO sync_state (key, value, updated_at) VALUES "
-            "('last_outcome_enqueued_at', ?, datetime('now')) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')",
-            (enqueued_at,),
+    with db.session() as s:
+        stmt = sqlite_insert(SyncState).values(key="last_outcome_enqueued_at", value=enqueued_at,
+                                               updated_at=func.datetime("now"))
+        s.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[SyncState.key],
+                set_={"value": stmt.excluded.value, "updated_at": func.datetime("now")},
+            ).execution_options(synchronize_session=False)
         )
-        c.commit()
+        s.commit()
 
 
 def _apply_pack_outcome(pack: dict) -> None:
     """Update dispatched_job + campaign_recipients from a resolved DynamoDB pack."""
     pack_id = pack["pack_id"]
-    status  = pack["status"]   # 'sent' | 'failed' | 'stuck_no_key' | 'cancelled'
+    status  = pack["status"]   # 'sent' | 'failed' | 'stuck_no_key' | 'cancelled' | 'unknown'
     resend_id     = pack.get("resend_message_id") or ""
     failure_reason = pack.get("failure_reason") or ""
+    if status == "unknown":
+        _apply_unknown_outcome(pack_id, failure_reason)
+        return
 
     job_status = "completed" if status == "sent" else "failed"
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    with db.conn() as c:
-        job = c.execute(
-            "SELECT campaign_id, recipient_id FROM dispatched_job WHERE job_id = ?",
-            (pack_id,),
-        ).fetchone()
+    with db.session() as s:
+        job = s.execute(
+            select(DispatchedJob.campaign_id, DispatchedJob.recipient_id).where(DispatchedJob.job_id == pack_id)
+        ).mappings().first()
         if not job:
             return
 
         if job_status == "completed":
-            c.execute(
-                "UPDATE dispatched_job SET status = ?, completed_at = ?, resend_message_id = ? WHERE job_id = ?",
-                (job_status, now_iso, resend_id, pack_id),
+            s.execute(
+                update(DispatchedJob).where(DispatchedJob.job_id == pack_id)
+                .values(status=job_status, completed_at=now_iso, resend_message_id=resend_id)
+                .execution_options(synchronize_session=False)
             )
         else:
-            c.execute(
-                "UPDATE dispatched_job SET status = ?, resend_message_id = ? WHERE job_id = ?",
-                (job_status, resend_id, pack_id),
+            s.execute(
+                update(DispatchedJob).where(DispatchedJob.job_id == pack_id)
+                .values(status=job_status, resend_message_id=resend_id)
+                .execution_options(synchronize_session=False)
             )
 
         cr_status  = "sent" if status == "sent" else "failed"
-        c.execute(
-            "UPDATE campaign_recipients SET status = ?, message_id = ?, "
-            "failure_reason = ?, sent_at = ? "
-            "WHERE campaign_id = ? AND contact_id = ? AND status NOT IN ('delivered','opened','clicked','bounced','complained')",
-            (cr_status, resend_id, failure_reason or None, now_iso if status == "sent" else None,
-             job["campaign_id"], job["recipient_id"]),
+        s.execute(
+            update(CampaignRecipient)
+            .where(CampaignRecipient.campaign_id == job["campaign_id"],
+                   CampaignRecipient.contact_id == job["recipient_id"],
+                   CampaignRecipient.status.not_in(("delivered", "opened", "clicked", "bounced", "complained")))
+            .values(status=cr_status, message_id=resend_id, failure_reason=failure_reason or None,
+                    sent_at=now_iso if status == "sent" else None)
+            .execution_options(synchronize_session=False)
         )
-        c.commit()
+        s.commit()
 
     if status != "sent":
         db.audit(
@@ -375,6 +397,32 @@ def _apply_pack_outcome(pack: dict) -> None:
             target=f"pack:{pack_id}",
             details={"status": status, "reason": failure_reason},
         )
+
+
+UNKNOWN_PREFIX = "Delivery unknown: "
+
+
+def _apply_unknown_outcome(pack_id: str, reason: str) -> None:
+    """the cloud cannot tell whether this pack's mail went out. The recipient keeps 'sent' (as
+    _record_dispatch left it) with the reason in failure_reason, and the job keeps 'dispatched', which
+    launch._RETRYABLE_JOB excludes, so neither Retry failed nor a launch mails them again."""
+    with db.session() as s:
+        job = s.execute(
+            select(DispatchedJob.campaign_id, DispatchedJob.recipient_id).where(DispatchedJob.job_id == pack_id)
+        ).mappings().first()
+        if not job:
+            return
+        s.execute(
+            update(CampaignRecipient)
+            .where(CampaignRecipient.campaign_id == job["campaign_id"],
+                   CampaignRecipient.contact_id == job["recipient_id"],
+                   CampaignRecipient.status == "sent")
+            .values(failure_reason=UNKNOWN_PREFIX + (reason or "no reason recorded"))
+            .execution_options(synchronize_session=False)
+        )
+        s.commit()
+    db.audit(actor="system:outcomes-loop", action="pack.outcome_unknown",
+             target=f"pack:{pack_id}", details={"status": "unknown", "reason": reason})
 
 
 async def outcomes_loop(stop: asyncio.Event) -> None:
@@ -427,12 +475,12 @@ def _materialise_inbox_batch(bundle: encryption.KeyBundle) -> int:
     'pack' rows are handled by outcomes_loop (direct API) - stamp them here so the
     inbox stays clean and backup gap-checks don't false-positive on them.
     """
-    with db.conn() as c:
-        rows = c.execute(
-            "SELECT event_id, table_name, encrypted_payload FROM inbox "
-            "WHERE materialised_at IS NULL AND table_name IN ('webhook_event', 'suppression') "
-            "ORDER BY event_id LIMIT 50"
-        ).fetchall()
+    with db.session() as s:
+        rows = s.execute(
+            select(InboxRow.event_id, InboxRow.table_name, InboxRow.encrypted_payload)
+            .where(InboxRow.materialised_at.is_(None), InboxRow.table_name.in_(("webhook_event", "suppression")))
+            .order_by(InboxRow.event_id).limit(50)
+        ).mappings().all()
 
     applied = 0
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -466,12 +514,12 @@ def _materialise_inbox_batch(bundle: encryption.KeyBundle) -> int:
 
 
 def _mark_materialised(event_id: int, now_iso: str) -> None:
-    with db.conn() as c:
-        c.execute(
-            "UPDATE inbox SET materialised_at = ? WHERE event_id = ?",
-            (now_iso, event_id),
+    with db.session() as s:
+        s.execute(
+            update(InboxRow).where(InboxRow.event_id == event_id)
+            .values(materialised_at=now_iso).execution_options(synchronize_session=False)
         )
-        c.commit()
+        s.commit()
 
 
 def _apply_webhook_event(payload: dict, now_iso: str) -> None:
@@ -481,11 +529,11 @@ def _apply_webhook_event(payload: dict, now_iso: str) -> None:
     if not message_id:
         return
 
-    with db.conn() as c:
-        row = c.execute(
-            "SELECT id, campaign_id, contact_id, status FROM campaign_recipients WHERE message_id = ?",
-            (message_id,),
-        ).fetchone()
+    with db.session() as s:
+        row = s.execute(
+            select(CampaignRecipient.id, CampaignRecipient.campaign_id, CampaignRecipient.contact_id,
+                   CampaignRecipient.status).where(CampaignRecipient.message_id == message_id)
+        ).mappings().first()
         if not row:
             return
 
@@ -500,30 +548,31 @@ def _apply_webhook_event(payload: dict, now_iso: str) -> None:
             # still lands in the inbox for forensics, but never touches engagement).
             return
         elif event_type == "email.clicked":
-            c.execute(
-                "UPDATE campaign_recipients SET status='clicked', clicked_at=? WHERE id=?",
-                (now_iso, row["id"]),
+            s.execute(
+                update(CampaignRecipient).where(CampaignRecipient.id == row["id"])
+                .values(status="clicked", clicked_at=now_iso).execution_options(synchronize_session=False)
             )
         elif event_type == "email.bounced":
-            c.execute(
-                "UPDATE campaign_recipients SET status='bounced', bounced_at=? WHERE id=?",
-                (now_iso, row["id"]),
+            s.execute(
+                update(CampaignRecipient).where(CampaignRecipient.id == row["id"])
+                .values(status="bounced", bounced_at=now_iso).execution_options(synchronize_session=False)
             )
             # Auto-suppress hard bounces to protect sender reputation
             import hashlib as _hl
-            email = c.execute("SELECT con.email FROM campaign_recipients cr "
-                              "JOIN contacts con ON con.id=cr.contact_id WHERE cr.id=?",
-                              (row["id"],)).fetchone()
+            cr, con = aliased(CampaignRecipient), aliased(Contact)
+            email = s.execute(select(con.email).select_from(cr)
+                              .join(con, con.id == cr.contact_id).where(cr.id == row["id"])).first()
             if email:
                 h = _hl.sha256(email[0].lower().encode()).hexdigest()
-                c.execute("INSERT OR IGNORE INTO suppression_hashes (email_hash, reason, source) VALUES (?,?,?)",
-                          (h, "bounce_hard", "auto:materialiser"))
+                s.execute(insert(SuppressionHash).prefix_with("OR IGNORE")
+                          .values(email_hash=h, reason="bounce_hard", source="auto:materialiser")
+                          .execution_options(synchronize_session=False))
         elif event_type == "email.complained":
-            c.execute(
-                "UPDATE campaign_recipients SET status='complained', complained_at=? WHERE id=?",
-                (now_iso, row["id"]),
+            s.execute(
+                update(CampaignRecipient).where(CampaignRecipient.id == row["id"])
+                .values(status="complained", complained_at=now_iso).execution_options(synchronize_session=False)
             )
-        c.commit()
+        s.commit()
 
 
 def _apply_suppression_event(payload: dict, now_iso: str) -> None:
@@ -533,25 +582,27 @@ def _apply_suppression_event(payload: dict, now_iso: str) -> None:
     source = payload.get("source", "sync")
     if not email_hash:
         return
-    with db.conn() as c:
-        c.execute(
-            "INSERT OR IGNORE INTO suppression_hashes (email_hash, reason, source, added_at) VALUES (?, ?, ?, ?)",
-            (email_hash, reason, source, payload.get("added_at", now_iso)),
+    with db.session() as s:
+        s.execute(
+            insert(SuppressionHash).prefix_with("OR IGNORE")
+            .values(email_hash=email_hash, reason=reason, source=source, added_at=payload.get("added_at", now_iso))
+            .execution_options(synchronize_session=False)
         )
-        c.commit()
+        s.commit()
 
 
 def _stamp_pack_inbox_rows() -> int:
     """Mark pack-outcome inbox rows as materialised - they're handled by outcomes_loop."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    with db.conn() as c:
-        rows = c.execute(
-            "SELECT event_id FROM inbox WHERE materialised_at IS NULL AND table_name = 'pack'"
-        ).fetchall()
+    with db.session() as s:
+        rows = s.execute(
+            select(InboxRow.event_id).where(InboxRow.materialised_at.is_(None), InboxRow.table_name == "pack")
+        ).mappings().all()
         if rows:
             for r in rows:
-                c.execute("UPDATE inbox SET materialised_at = ? WHERE event_id = ?", (now, r["event_id"]))
-            c.commit()
+                s.execute(update(InboxRow).where(InboxRow.event_id == r["event_id"])
+                          .values(materialised_at=now).execution_options(synchronize_session=False))
+            s.commit()
             log.debug("materialiser: stamped %d pack rows as materialised", len(rows))
     return len(rows)
 
@@ -591,12 +642,12 @@ def _drain_batches() -> None:
     from mailman.terminal import send_schedule, settings as _s
     now = datetime.now(timezone.utc)
     now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    with db.conn() as c:
-        rows = c.execute(
-            "SELECT id, window_end FROM campaign_batches "
-            "WHERE status='sending' AND window_end IS NOT NULL AND window_end < ?",
-            (now_iso,),
-        ).fetchall()
+    with db.session() as s:
+        rows = s.execute(
+            select(CampaignBatch.id, CampaignBatch.window_end)
+            .where(CampaignBatch.status == "sending", CampaignBatch.window_end.is_not(None),
+                   CampaignBatch.window_end < now_iso)
+        ).mappings().all()
         if not rows:
             return
         unlock = send_schedule.next_window_open_after(
@@ -606,18 +657,290 @@ def _drain_batches() -> None:
             window_hours=_s.get_int("send_window_hours", 4),
         )
         for r in rows:
-            c.execute(
-                "UPDATE campaign_batches SET status='drained', drained_at=?, "
-                "approve_unlock_at=? WHERE id=?",
-                (now_iso, unlock, r["id"]),
+            s.execute(
+                update(CampaignBatch).where(CampaignBatch.id == r["id"])
+                .values(status="drained", drained_at=now_iso, approve_unlock_at=unlock)
+                .execution_options(synchronize_session=False)
             )
-        c.commit()
+        s.commit()
         log.info("batch: %d batch(es) drained; approve-next unlocks at %s", len(rows), unlock)
 
 
 # Scheduler loop - auto-launch scheduled campaigns
 
 SCHEDULER_INTERVAL_S = int(os.environ.get("SCHEDULER_INTERVAL_S", "60"))
+_RETRY_NOTE_WINDOW = "-1 day"
+_UNPARSEABLE_TIME = "its scheduled time is not a valid date and time"
+ARCHIVED_STAGE_REASON = "the campaign was archived before this stage went out"
+CANCELLED_STAGE_REASON = "the campaign was cancelled before this stage went out"
+_STAGE_CANCEL_REASON = {"archived": ARCHIVED_STAGE_REASON, "cancelled": CANCELLED_STAGE_REASON}
+_RETRY_GIVE_UP_S = 24 * 60 * 60
+_STREAK_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def _still_scheduled(campaign_id: int) -> bool:
+    with db.session() as s:
+        return s.execute(select(Campaign.status).where(Campaign.id == campaign_id)).scalar_one_or_none() == "scheduled"
+
+
+def _note_retry(action: str, campaign_id: int, details: dict) -> None:
+    """A launch the scheduler will try again is audited once per distinct reason per day,
+    not once a tick. It writes no drift row."""
+    from mailman.terminal.models import AuditEvent
+    target, payload = f"campaign:{campaign_id}", json.dumps(details)
+    with db.session() as s:
+        seen = s.execute(select(AuditEvent.id).where(
+            AuditEvent.action == action, AuditEvent.target == target, AuditEvent.details_json == payload,
+            AuditEvent.occurred_at >= func.datetime("now", _RETRY_NOTE_WINDOW)).limit(1)).first()
+    if seen is None:
+        db.audit(actor="system:scheduler", action=action, target=target, details=details)
+
+
+def _now() -> datetime:
+    """The scheduler's clock for the 24 h refusal rule; tests replace it."""
+    return datetime.now(timezone.utc)
+
+
+def _streak(campaign_id: int, now: datetime) -> tuple[datetime, str | None]:
+    """When the campaign's current streak of unexpected launch errors began, and the
+    campaigns.updated_at it belongs to. The newest retry row that has a streak_start carries the streak while
+    the campaign's updated_at still equals the one stored with it; a successful launch and an operator edit
+    both bump updated_at, so either one starts a new streak. Rows without streak_start (LaunchRetryable
+    reasons) neither count toward it nor end it. A new streak starts at now."""
+    from mailman.terminal.models import AuditEvent
+    with db.session() as s:
+        since = s.execute(select(Campaign.updated_at).where(Campaign.id == campaign_id)).scalar_one_or_none()
+        raws = s.execute(select(AuditEvent.details_json).where(
+            AuditEvent.action == "campaign.scheduled_launch_retrying", AuditEvent.target == f"campaign:{campaign_id}")
+            .order_by(AuditEvent.id.desc())).scalars().all()
+    for raw in raws:
+        try:
+            d = json.loads(raw)
+            begun = datetime.strptime(d["streak_start"], _STREAK_FMT).replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError, KeyError):
+            continue
+        return (begun if d.get("updated_at") == since else now), since
+    return now, since
+
+
+def _refuse_campaign(campaign_id: int, error: str, since: str | None = None, unparseable: str | None = None) -> bool:
+    """A due campaign launch refused leaves 'scheduled' for 'failed', with one audit row and one
+    drift row carrying the reason, in one transaction. The update is guarded by the selection predicate,
+    so an operator change made while the scheduler held the campaign wins. Returns True if this call moved it.
+    since: the updated_at the 24 h streak belongs to; an operator edit after it wins."""
+    from mailman.terminal.models import AuditEvent
+    due = ((Campaign.scheduled_for == unparseable,) if unparseable is not None else  # Same unreadable value.
+           (Campaign.scheduled_for.is_not(None), func.datetime(Campaign.scheduled_for) <= func.datetime("now")))
+    with db.session() as s:
+        moved = s.execute(
+            update(Campaign)
+            .where(Campaign.id == campaign_id, Campaign.status == "scheduled", *due)
+            .where(Campaign.updated_at == since if since is not None else True)
+            .values(status="failed", updated_at=func.datetime("now"))
+            .execution_options(synchronize_session=False)).rowcount == 1
+        s.execute(insert(AuditEvent)
+                  .values(actor="system:scheduler", action="campaign.scheduled_launch_failed",
+                          target=f"campaign:{campaign_id}",
+                          details_json=json.dumps({"error": error, "marked_failed": moved}))
+                  .execution_options(synchronize_session=False))
+        s.execute(insert(DriftReport)
+                  .values(severity="WARN", category="status_mismatch", job_id=f"sched:{campaign_id}",
+                          details_json=json.dumps({"campaign_id": campaign_id, "error": error,
+                                                   "marked_failed": moved}),
+                          detected_at=func.datetime("now"))
+                  .execution_options(synchronize_session=False))
+        s.commit()
+    return moved
+
+
+def _fail_stage(campaign_id: int, stage_id: int, error: str, possibly_sent: bool) -> None:
+    """A refused stage is marked failed with one audit row and one drift row, in one transaction.
+    possibly_sent: the failure came after the push began, or was any unexpected (non-LaunchError) error, so some of its mail may be live."""
+    from mailman.terminal.models import AuditEvent
+    with db.session() as s:
+        s.execute(update(CampaignStage).where(CampaignStage.id == stage_id, CampaignStage.status == "pending")
+                  .values(status="failed").execution_options(synchronize_session=False))
+        s.execute(insert(AuditEvent)
+                  .values(actor="system:scheduler", action="campaign.stage_failed", target=f"campaign:{campaign_id}",
+                          details_json=json.dumps({"stage_id": stage_id, "error": error,
+                                                   "possibly_sent": possibly_sent}))
+                  .execution_options(synchronize_session=False))
+        s.execute(insert(DriftReport)
+                  .values(severity="WARN", category="status_mismatch", job_id=f"stage:{stage_id}",
+                          details_json=json.dumps({"campaign_id": campaign_id, "stage_id": stage_id, "error": error,
+                                                   "possibly_sent": possibly_sent}),
+                          detected_at=func.datetime("now"))
+                  .execution_options(synchronize_session=False))
+        s.commit()
+
+
+def _stage_still_due(stage_id: int) -> bool:
+    """Re-read a selected stage right before its launch. An archive (or a pause) pressed while this tick
+    was launching earlier stages wins; a launch already under way is not stopped."""
+    with db.session() as s:
+        return s.execute(
+            select(CampaignStage.id).join(Campaign, Campaign.id == CampaignStage.campaign_id)
+            .where(CampaignStage.id == stage_id, CampaignStage.status == "pending",
+                   Campaign.status.not_in(("paused", "draft", "archived", "cancelled")))
+        ).first() is not None
+
+
+def _cancel_archived_stage(campaign_id: int, stage_id: int, campaign_status: str = "archived") -> bool:
+    """A pending stage of an archived campaign leaves 'pending' for 'cancelled' with one audit row carrying
+    the reason, in one transaction. Guarded on the stage still pending and the campaign still archived, so an
+    operator change made in between wins and nothing is written. Returns True if this call moved it."""
+    from mailman.terminal.models import AuditEvent
+    reason = _STAGE_CANCEL_REASON[campaign_status]   # KeyError before any write
+    with db.session() as s:
+        archived = select(Campaign.id).where(Campaign.id == campaign_id, Campaign.status == campaign_status).exists()
+        moved = s.execute(
+            update(CampaignStage)
+            .where(CampaignStage.id == stage_id, CampaignStage.status == "pending", archived)
+            .values(status="cancelled")
+            .execution_options(synchronize_session=False)).rowcount == 1
+        if moved:
+            s.execute(insert(AuditEvent)
+                      .values(actor="system:scheduler", action="campaign.stage_cancelled",
+                              target=f"campaign:{campaign_id}",
+                              details_json=json.dumps({"stage_id": stage_id, "reason": reason}))
+                      .execution_options(synchronize_session=False))
+        s.commit()
+    return moved
+
+
+async def scheduler_tick() -> None:
+    """One scheduler pass (split out of scheduler_loop so a tick can be driven directly)."""
+    from mailman.terminal import launch as _launch
+    # 0. Release elapsed campaign locks
+    try:
+        from mailman.terminal import campaign_lock
+        released = campaign_lock.confirm_elapsed_locks()
+        if released:
+            log.info("lock: confirmed %d campaign(s), contacts released", released)
+    except Exception as e:
+        log.warning("lock confirm error: %s", e)
+
+    # 0b. Batch drain -> cooldown (v3.22)
+    try:
+        _drain_batches()
+    except Exception as e:
+        log.warning("batch drain error: %s", e)
+    # 1. Single-shot scheduled campaigns
+    with db.session() as s:
+        due = s.execute(
+            select(Campaign.id)
+            .where(Campaign.status == "scheduled", Campaign.scheduled_for.is_not(None),
+                   func.datetime(Campaign.scheduled_for) <= func.datetime("now"))
+            .order_by(Campaign.id)
+        ).mappings().all()
+    for row in due:
+        campaign_id = row["id"]
+        try:
+            await _launch.launch_campaign(campaign_id, actor="system:scheduler")
+            log.info("scheduler: launched campaign %d", campaign_id)
+        except Exception as exc:
+            try:
+                reason = str(exc) or type(exc).__name__
+                retry = isinstance(exc, _launch.LaunchRetryable) or not isinstance(exc, _launch.LaunchError)
+                if retry and _still_scheduled(campaign_id):
+                    if isinstance(exc, _launch.LaunchError):
+                        _, since = _streak(campaign_id, _now())
+                        log.warning("scheduler: campaign %d not launched, retrying next tick: %s", campaign_id, reason)
+                        _note_retry("campaign.scheduled_launch_retrying", campaign_id, {"error": reason, "updated_at": since})
+                    else:
+                        now = _now()
+                        begun, since = _streak(campaign_id, now)
+                        if (now - begun).total_seconds() >= _RETRY_GIVE_UP_S:
+                            log.warning("scheduler: campaign %d refused after a day of unexpected errors: %s",
+                                        campaign_id, reason)
+                            _refuse_campaign(campaign_id, reason, since)
+                        else:
+                            log.warning("scheduler: campaign %d not launched, retrying next tick: %s",
+                                        campaign_id, reason)
+                            _note_retry("campaign.scheduled_launch_retrying", campaign_id,
+                                        {"error": reason, "streak_start": begun.strftime(_STREAK_FMT),
+                                         "updated_at": since})
+                else:
+                    log.warning("scheduler: campaign %d refused: %s", campaign_id, reason)
+                    _refuse_campaign(campaign_id, reason)
+            except Exception as rec:
+                log.warning("scheduler: could not record campaign %d: %s", campaign_id, rec)
+    # Cancel a pending stage of an archived campaign once, with the reason.
+    with db.session() as s:
+        archived_stages = s.execute(
+            select(CampaignStage.id.label("stage_id"), CampaignStage.campaign_id, Campaign.status.label("campaign_status"))
+            .join(Campaign, Campaign.id == CampaignStage.campaign_id)
+            .where(CampaignStage.status == "pending", Campaign.status.in_(("archived", "cancelled")))
+        ).mappings().all()
+    for row in archived_stages:
+        try:
+            if _cancel_archived_stage(row["campaign_id"], row["stage_id"], row["campaign_status"]):
+                log.info("scheduler: stage %d not sent: %s", row["stage_id"], _STAGE_CANCEL_REASON[row["campaign_status"]])
+        except Exception as rec:
+            log.warning("scheduler: could not record stage %d: %s", row["stage_id"], rec)
+    # 2. Multi-stage campaign stages
+    with db.session() as s:
+        cs, ca = aliased(CampaignStage), aliased(Campaign)
+        due_stages = s.execute(
+            select(cs.id.label("stage_id"), cs.campaign_id, cs.template_id, cs.stage_number)
+            .join(ca, ca.id == cs.campaign_id)
+            .where(
+                cs.status == "pending",
+                func.datetime(cs.scheduled_for) <= func.datetime("now"),
+                ca.status.not_in(("paused", "draft", "archived", "cancelled")),
+                ca.test_sent_at.is_not(None),
+            )
+        ).mappings().all()
+    for row in due_stages:
+        if not _stage_still_due(row["stage_id"]):   # An archive or pause pressed during this tick wins
+            continue
+        try:
+            await _launch.launch_campaign(
+                row["campaign_id"], actor="system:scheduler",
+                template_id_override=row["template_id"],
+                stage_id=row["stage_id"],
+            )
+            log.info("scheduler: launched stage %d (campaign %d, stage #%d)",
+                     row["stage_id"], row["campaign_id"], row["stage_number"])
+        except Exception as exc:
+            try:
+                reason = str(exc) or type(exc).__name__
+                if isinstance(exc, _launch.LaunchRetryable):
+                    log.warning("scheduler: stage %d not launched, retrying next tick: %s", row["stage_id"], reason)
+                    _note_retry("campaign.stage_retrying", row["campaign_id"],
+                                {"stage_id": row["stage_id"], "error": reason})
+                else:
+                    sent = isinstance(exc, _launch.LaunchPushError) or not isinstance(exc, _launch.LaunchError)
+                    log.warning("scheduler: stage %d failed: %s", row["stage_id"], reason)
+                    _fail_stage(row["campaign_id"], row["stage_id"], reason, sent)
+            except Exception as rec:
+                log.warning("scheduler: could not record stage %d: %s", row["stage_id"], rec)
+    # 3. A stored time SQLite cannot read never comes due; fail it once, with the reason.
+    with db.session() as s:
+        bad_campaigns = s.execute(
+            select(Campaign.id, Campaign.scheduled_for)
+            .where(Campaign.status == "scheduled", Campaign.scheduled_for.is_not(None),
+                   func.datetime(Campaign.scheduled_for).is_(None))
+        ).mappings().all()
+        cs, ca = aliased(CampaignStage), aliased(Campaign)
+        bad_stages = s.execute(
+            select(cs.id.label("stage_id"), cs.campaign_id)
+            .join(ca, ca.id == cs.campaign_id)
+            .where(cs.status == "pending", func.datetime(cs.scheduled_for).is_(None),
+                   ca.status.not_in(("paused", "draft", "archived", "cancelled")), ca.test_sent_at.is_not(None))
+        ).mappings().all()
+    for row in bad_campaigns:
+        try:
+            log.warning("scheduler: campaign %d refused: %s", row["id"], _UNPARSEABLE_TIME)
+            _refuse_campaign(row["id"], _UNPARSEABLE_TIME, unparseable=row["scheduled_for"])
+        except Exception as rec:
+            log.warning("scheduler: could not record campaign %d: %s", row["id"], rec)
+    for row in bad_stages:
+        try:
+            log.warning("scheduler: stage %d failed: %s", row["stage_id"], _UNPARSEABLE_TIME)
+            _fail_stage(row["campaign_id"], row["stage_id"], _UNPARSEABLE_TIME, possibly_sent=False)
+        except Exception as rec:
+            log.warning("scheduler: could not record stage %d: %s", row["stage_id"], rec)
 
 
 async def scheduler_loop(stop: asyncio.Event) -> None:
@@ -626,72 +949,7 @@ async def scheduler_loop(stop: asyncio.Event) -> None:
     while not stop.is_set():
         try:
             await asyncio.sleep(SCHEDULER_INTERVAL_S)
-            from mailman.terminal import launch as _launch
-
-            # 0. Release elapsed campaign locks (Option B: window + pull)
-            try:
-                from mailman.terminal import campaign_lock
-                released = campaign_lock.confirm_elapsed_locks()
-                if released:
-                    log.info("lock: confirmed %d campaign(s), contacts released", released)
-            except Exception as e:
-                log.warning("lock confirm error: %s", e)
-
-            # 0b. Batch drain -> cooldown (v3.22)
-            try:
-                _drain_batches()
-            except Exception as e:
-                log.warning("batch drain error: %s", e)
-
-            # 1. Single-shot scheduled campaigns
-            with db.conn() as c:
-                due = c.execute(
-                    "SELECT id FROM campaigns WHERE status='scheduled' "
-                    "AND scheduled_for IS NOT NULL AND scheduled_for <= datetime('now')"
-                ).fetchall()
-            for row in due:
-                campaign_id = row["id"]
-                try:
-                    await _launch.launch_campaign(campaign_id, actor="system:scheduler")
-                    log.info("scheduler: launched campaign %d", campaign_id)
-                except Exception as exc:
-                    log.warning("scheduler: failed to launch campaign %d: %s", campaign_id, exc)
-                    db.audit(actor="system:scheduler", action="campaign.scheduled_launch_failed",
-                             target=f"campaign:{campaign_id}", details={"error": str(exc)})
-                    with db.conn() as c:
-                        c.execute("INSERT INTO drift_report (severity, category, job_id, detected_at) "
-                                  "VALUES ('WARN', 'status_mismatch', ?, datetime('now'))",
-                                  (f"sched:{campaign_id}",))
-                        c.commit()
-
-            # 2. Multi-stage campaign stages
-            with db.conn() as c:
-                due_stages = c.execute(
-                    "SELECT cs.id AS stage_id, cs.campaign_id, cs.template_id, cs.stage_number "
-                    "FROM campaign_stages cs "
-                    "JOIN campaigns ca ON ca.id = cs.campaign_id "
-                    "WHERE cs.status = 'pending' "
-                    "AND cs.scheduled_for <= datetime('now') "
-                    "AND ca.status NOT IN ('paused', 'draft') "
-                    "AND ca.test_sent_at IS NOT NULL"
-                ).fetchall()
-            for row in due_stages:
-                try:
-                    await _launch.launch_campaign(
-                        row["campaign_id"], actor="system:scheduler",
-                        template_id_override=row["template_id"],
-                        stage_id=row["stage_id"],
-                    )
-                    log.info("scheduler: launched stage %d (campaign %d, stage #%d)",
-                             row["stage_id"], row["campaign_id"], row["stage_number"])
-                except Exception as exc:
-                    log.warning("scheduler: stage %d failed: %s", row["stage_id"], exc)
-                    with db.conn() as c:
-                        c.execute("UPDATE campaign_stages SET status='failed' WHERE id=?",
-                                  (row["stage_id"],))
-                        c.commit()
-                    db.audit(actor="system:scheduler", action="campaign.stage_failed",
-                             target=f"campaign:{row['campaign_id']}", details={"stage_id": row["stage_id"], "error": str(exc)})
+            await scheduler_tick()
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -707,12 +965,11 @@ def enqueue_local_write(
     """The CRUD path calls this after writing locally. The push loop will
     pick it up + ship to cloud.
     """
-    with db.conn() as c:
-        c.execute(
-            "INSERT INTO outbox (table_name, row_id, revision, actor, modified_at, "
-            "key_id, encrypted_payload, deleted) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (table, row_id, revision, TERMINAL_ACTOR, modified_at,
-             key_id, encrypted_payload, 1 if deleted else 0),
+    with db.session() as s:
+        s.execute(
+            insert(OutboxRow).values(table_name=table, row_id=row_id, revision=revision, actor=TERMINAL_ACTOR,
+                                     modified_at=modified_at, key_id=key_id, encrypted_payload=encrypted_payload,
+                                     deleted=1 if deleted else 0)
+            .execution_options(synchronize_session=False)
         )
-        c.commit()
+        s.commit()
