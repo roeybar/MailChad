@@ -17,16 +17,29 @@ Views:
 from __future__ import annotations
 
 import html as _html
+import json as _json
 import math
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
+from sqlalchemy import func, insert, or_, select, update
+from sqlalchemy.orm import aliased
 
 from mailman.terminal import db, launch, settings as _settings
 from mailman.terminal.auth import require_session
+from mailman.terminal.models import (AuditEvent, Campaign, CampaignBatch, CampaignRecipient, CampaignStage, Contact,
+                                      DispatchedJob, DriftReport, Entity, MetricsSnapshot, Operator, SeedAddress,
+                                      OutboxRow, SeedPlacement, SuppressionHash, SyncState, Template, cols)
+
+from mailman.terminal.routes_admin import AddToCampaignIn, EntityKeyIn, TagDeleteIn
 
 router = APIRouter()
+
+_OLD_BADGE = "ENCRYPTED END-TO-END"
+_OLD_BADGE_WARNING = ("This template still contains the old 'ENCRYPTED END-TO-END' badge text, "
+                      "which is not accurate. Remove it before sending.")
+_SAMPLE_COMPANY = "MailMan"
 
 # design system CSS (embedded, no external assets)
 _CSS = """
@@ -228,7 +241,7 @@ def _config_section(title: str, rows_html: str) -> str:
     chev = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>'
     return f"""<details class="card" style="margin-top:28px">
   <summary style="padding:14px 20px;cursor:pointer;font-weight:600;font-size:13.5px;list-style:none;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border)">
-    ⚙ {title} {chev}
+    \u2699 {title} {chev}
   </summary>
   <div style="padding:0 20px 4px">{rows_html}</div>
 </details>"""
@@ -239,7 +252,7 @@ def _config_block(title: str, content_html: str) -> str:
     chev = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>'
     return f"""<details class="card" style="margin-top:16px">
   <summary style="padding:14px 20px;cursor:pointer;font-weight:600;font-size:13.5px;list-style:none;display:flex;align-items:center;justify-content:space-between">
-    ⚙ {title} {chev}
+    \u2699 {title} {chev}
   </summary>
   <div style="padding:12px 20px 18px">{content_html}</div>
 </details>"""
@@ -312,7 +325,8 @@ def _layout(title: str, body: str, current: str = "", session: dict | None = Non
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{_html.escape(title)} · MailMan</title>
+<link rel="icon" type="image/png" href="/favicon.ico">
+<title>{_html.escape(title)} \u00B7 MailMan</title>
 <script>(function(){{try{{var t=localStorage.getItem('mc_theme')||'light';document.documentElement.setAttribute('data-theme',t)}}catch(e){{}}}})();</script>
 <style>{_CSS}</style>
 </head>
@@ -320,7 +334,7 @@ def _layout(title: str, body: str, current: str = "", session: dict | None = Non
 <aside class="sidebar">
   <a class="sb-brand" href="/admin">
     <span class="mark">{mail_svg}</span>
-    <span class="sb-wordmark">MailMan<span class="v">v3</span></span>
+    <span class="sb-wordmark">MailMan<span class="v">v4</span></span>
   </a>
   <nav class="sb-nav">{nav_html}</nav>
   <div class="sb-footer">
@@ -343,6 +357,7 @@ def _layout(title: str, body: str, current: str = "", session: dict | None = Non
 </div>
 {page_js}
 {_HELP_JS}
+{_TZ_JS}
 <script>
 /* Scroll position preservation across reloads */
 (function(){{
@@ -456,23 +471,95 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape'){document.qu
 </script>"""
 
 
-def _stages_html(cid: int, stages: list, tmpl_opts: str) -> str:
-    STATUS_COLOR = {"pending": "info", "dispatched": "ok", "failed": "crit", "paused": "warn"}
+_TZ_JS = r"""<script>
+/* Schedule times are entered and shown in the browser zone; the server stores UTC. */
+function _pad2(n){return (n<10?'0':'')+n;}
+function tzName(){
+  try{var z=Intl.DateTimeFormat().resolvedOptions().timeZone;if(z)return z;}catch(e){}
+  var m=-new Date().getTimezoneOffset(),s=m<0?'-':'+';m=Math.abs(m);
+  return 'UTC'+s+_pad2(Math.floor(m/60))+':'+_pad2(m%60);
+}
+function toUtcIso(v){
+  v=(v||'').trim().replace(' ','T');
+  if(!v)return '';
+  if(!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(v))return null;
+  var d=new Date(v);
+  if(isNaN(d.getTime()))return null;
+  return d.toISOString();
+}
+function fmtLocal(s){
+  s=(s||'').trim();
+  if(!s)return '';
+  var iso=s.replace(' ','T');
+  if(!/(Z|[+-]\d{2}:?\d{2})$/.test(iso))iso+='Z';
+  var d=new Date(iso);
+  if(isNaN(d.getTime()))return s;
+  return d.getFullYear()+'-'+_pad2(d.getMonth()+1)+'-'+_pad2(d.getDate())+' '+_pad2(d.getHours())+':'+_pad2(d.getMinutes());
+}
+function _utcSubmit(inputId,hiddenId){
+  var inp=document.getElementById(inputId),hid=document.getElementById(hiddenId);
+  var u=toUtcIso(inp.value);
+  if(u===null){alert('Enter a valid date and time.');return false;}
+  hid.value=u;hid.name='scheduled_for';inp.removeAttribute('name');
+  return true;
+}
+(function(){
+  var z=tzName();
+  document.querySelectorAll('.tz-label').forEach(function(el){el.textContent=z;});
+  document.querySelectorAll('time[data-local]').forEach(function(el){
+    var t=fmtLocal(el.getAttribute('datetime'));
+    if(t){el.title=el.textContent+' UTC';el.textContent=t;}
+  });
+})();
+</script>"""
+
+
+def _local_time(value: str | None) -> str:
+    """A stored UTC time as <time datetime="...Z" data-local>; _TZ_JS shows it in the browser zone.
+    Without JS it reads as UTC (the header or label says so). Unparseable text is shown escaped."""
+    if not value:
+        return "-"
+    from mailman.terminal.routes_admin import parse_utc_naive
+    try:
+        when = parse_utc_naive(value)
+    except ValueError:
+        return _html.escape(value[:16])
+    return (f'<time datetime="{when.isoformat(timespec="seconds")}Z" data-local>'
+            f'{when.isoformat(sep=" ", timespec="minutes")}</time>')
+
+
+def _stages_html(cid: int, stages: list, tmpl_opts: str, stage_errors: dict[int, tuple[str, bool]] | None = None) -> str:
+    STATUS_COLOR = {"pending": "info", "dispatched": "ok", "failed": "crit", "paused": "warn", "cancelled": "warn"}
     rows_html = ""
     for s in stages:
         sc = STATUS_COLOR.get(s["status"], "")
+        err = (stage_errors or {}).get(s["id"]) if s["status"] == "failed" else None
+        if err is None:
+            err_html = ""
+        elif err[1]:
+            err_html = (f'<div class="callout crit" style="margin-top:6px"><div class="ct-body">Stage failed: '
+                        f'{_html.escape(err[0].rstrip("."))}. Some of its mail may already be on its way; check the Analytics '
+                        f'page before adding the stage again, or recipients may get it twice.</div></div>')
+        else:
+            err_html = (f'<div class="callout crit" style="margin-top:6px"><div class="ct-body">Not sent: '
+                        f'{_html.escape(err[0].rstrip("."))}. Delete this stage and add it again once the cause is fixed.</div></div>')
+        if s["status"] == "cancelled":   # Cancelled before this stage went out
+            from mailman.terminal.sync_client import ARCHIVED_STAGE_REASON
+            err_html = ('<div class="callout warn" style="margin-top:6px"><div class="ct-body">Not sent: '
+                        f'{_html.escape(((stage_errors or {}).get(s["id"]) or (ARCHIVED_STAGE_REASON,))[0])}.</div></div>')
         rows_html += (
             f'<div class="row" style="gap:12px;padding:10px 0;border-bottom:1px solid var(--border);align-items:center">'
             f'<span class="pill {sc}" style="flex-shrink:0"><span class="dot"></span>Stage {s["stage_number"]}</span>'
             f'<div style="flex:1;min-width:0">'
             f'<div class="cell-strong" style="font-size:13px">{_html.escape(s["template_name"])}</div>'
-            f'<div class="dim" style="font-size:12px">{(s["scheduled_for"] or "-")[:16]}'
-            + (f' · {_html.escape(s["note"])}' if s.get("note") else "") +
-            f'{"  ·  Dispatched " + (s["dispatched_at"] or "")[:16] if s["status"] == "dispatched" else ""}'
+            f'<div class="dim" style="font-size:12px">{_local_time(s["scheduled_for"])} (<span class="tz-label">UTC</span>)'
+            + (f' \u00B7 {_html.escape(s["note"])}' if s.get("note") else "") +
+            f'{"  &middot;  Dispatched " + _local_time(s["dispatched_at"]) if s["status"] == "dispatched" else ""}'
+            f'{err_html}'
             f'</div></div>'
             f'<div class="row-actions">'
             + (f'<form method="post" action="/admin/campaigns/{cid}/stages/{s["id"]}/delete" style="display:inline">'
-               f'<button class="btn ghost sm" style="color:var(--danger-fg)" {"disabled" if s["status"]=="dispatched" else ""}>✕</button></form>'
+               f'<button class="btn ghost sm" style="color:var(--danger-fg)" {"disabled" if s["status"]=="dispatched" else ""}>\u2715</button></form>'
                if s["status"] != "dispatched" else "") +
             f'</div></div>'
         )
@@ -484,10 +571,10 @@ def _stages_html(cid: int, stages: list, tmpl_opts: str) -> str:
 </div>
 <div class="form">
   <div class="section-title">Add a stage</div>
-  <form method="post" action="/admin/campaigns/{cid}/stages/add">
+  <form method="post" action="/admin/campaigns/{cid}/stages/add" onsubmit="return _utcSubmit('stage-at','stage-at-utc')">
     <div class="form-grid">
       <div class="field"><label>Template</label><select name="template_id" required>{tmpl_opts}</select></div>
-      <div class="field"><label>Fire date &amp; time</label><input type="datetime-local" name="scheduled_for" required></div>
+      <div class="field"><label for="stage-at">Fire date &amp; time <span class="hint">(<span class="tz-label">UTC</span>)</span></label><input type="datetime-local" id="stage-at" name="scheduled_for" required><input type="hidden" id="stage-at-utc"></div>
       <div class="field span-2"><label>Note <span class="hint">optional label</span></label><input type="text" name="note" placeholder="e.g. Day 3 follow-up"></div>
     </div>
     <div class="form-actions" style="margin-top:12px"><button class="btn primary" type="submit">Add stage</button></div>
@@ -495,24 +582,103 @@ def _stages_html(cid: int, stages: list, tmpl_opts: str) -> str:
 </div>"""
 
 
+def _scheduler_errors(cid: int) -> tuple[str | None, dict[int, tuple[str, bool]]]:
+    """The scheduler's last refusal of campaign cid and, per stage id, its last stage failure with its
+    possibly_sent flag, read from the audit rows sync_client writes. Reads one campaign row only."""
+    target = f"campaign:{cid}"
+    with db.session() as s:
+        camp_raw = s.execute(select(AuditEvent.details_json)
+                             .where(AuditEvent.target == target, AuditEvent.action == "campaign.scheduled_launch_failed")
+                             .order_by(AuditEvent.id.desc()).limit(1)).scalar_one_or_none()
+        stage_raws = s.execute(select(AuditEvent.details_json)
+                               .where(AuditEvent.target == target, AuditEvent.action.in_(("campaign.stage_failed", "campaign.stage_cancelled")))
+                               .order_by(AuditEvent.id)).scalars().all()
+    camp_err = _audit_details(camp_raw).get("error") or None
+    stage_err = {}
+    for raw in stage_raws:
+        d = _audit_details(raw)
+        if d.get("stage_id") is not None and (d.get("error") or d.get("reason")):
+            stage_err[int(d["stage_id"])] = (d.get("error") or d["reason"], d.get("possibly_sent") is not False if d.get("error") else False)
+    return camp_err, stage_err
+
+
+def _scheduler_retry(cid: int, since: str) -> str | None:
+    """The newest reason the scheduler recorded for not launching campaign cid yet, written at or after since
+    (the campaign's updated_at, so a reason from before the operator last changed it is not shown)."""
+    with db.session() as s:
+        raw = s.execute(select(AuditEvent.details_json)
+                        .where(AuditEvent.target == f"campaign:{cid}",
+                               AuditEvent.action == "campaign.scheduled_launch_retrying",
+                               AuditEvent.occurred_at >= since)
+                        .order_by(AuditEvent.id.desc()).limit(1)).scalar_one_or_none()
+    return _audit_details(raw).get("error") or None
+
+
+def _audit_details(raw: str | None) -> dict:
+    try:
+        d = _json.loads(raw or "{}")
+    except ValueError:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
 # routes
+
+_SYNC_STALE_AFTER_S = 300
+
+
+def _sync_card_html(now: datetime | None = None) -> str:
+    """Overview Sync status card, from recorded state only."""
+    from mailman.terminal import encryption, sync_client
+    bearer_path = encryption.KEYS_DIR / "cloud_bearer.txt"
+    handshake_done = bearer_path.exists() and bearer_path.read_text().strip() != ""
+    with db.session() as s:
+        last_pull = s.execute(select(SyncState.value).where(SyncState.key == "last_pull_ok_at")).scalar_one_or_none()
+        last_push = s.execute(select(func.max(OutboxRow.pushed_at))).scalar_one()
+        pending = s.execute(select(func.count()).select_from(OutboxRow).where(OutboxRow.pushed_at.is_(None))).scalar_one()
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    if not handshake_done:
+        pill, label = "crit", "handshake pending"
+    elif not last_pull:
+        pill, label = "warn", "no pull yet"
+    else:
+        try:
+            age = (now - datetime.fromisoformat(last_pull)).total_seconds()
+        except (ValueError, TypeError):
+            age = None
+        pill, label = ("ok", "pulling") if age is not None and age <= _SYNC_STALE_AFTER_S else ("warn", "pull stale")
+
+    def _row(k: str, v: str) -> str:
+        return (f'<div class="row between"><span class="muted">{k}</span>'
+                f'<span class="mono cell-dim">{_html.escape(v)}</span></div>')
+    rows = (_row("Last pull", f"{last_pull} UTC" if last_pull else "never")
+            + _row("Last push", f"{last_push} UTC" if last_push else "never")
+            + _row("Outbox pending", str(pending))
+            + _row("Sync actor", sync_client.TERMINAL_ACTOR))
+    return (f'<div class="card pad" id="sync-card">'
+            f'<div class="section-title between" style="display:flex;margin-bottom:14px">Sync status '
+            f'<span class="pill {pill}"><span class="dot"></span>{label}</span></div>'
+            f'<div class="stack" style="gap:11px;font-size:13px">{rows}</div></div>')
+
 
 @router.get("/admin", response_class=HTMLResponse)
 def overview(session=Depends(require_session)):
-    with db.conn() as c:
-        s = lambda q: c.execute(q).fetchone()[0]
-        contacts    = s("SELECT count(*) FROM contacts")
-        templates   = s("SELECT count(*) FROM templates")
-        campaigns   = s("SELECT count(*) FROM campaigns")
-        dispatched  = s("SELECT count(*) FROM dispatched_job WHERE status='dispatched'")
-        suppression = s("SELECT count(*) FROM suppression_hashes")
-        drift_crit  = s("SELECT count(*) FROM drift_report WHERE severity='CRITICAL' AND acknowledged_at IS NULL")
-        drift_warn  = s("SELECT count(*) FROM drift_report WHERE severity='WARN' AND acknowledged_at IS NULL")
+    with db.session() as s:
+        contacts    = s.execute(select(func.count()).select_from(Contact)).scalar_one()
+        templates   = s.execute(select(func.count()).select_from(Template)).scalar_one()
+        campaigns   = s.execute(select(func.count()).select_from(Campaign)).scalar_one()
+        dispatched  = s.execute(select(func.count()).select_from(DispatchedJob)
+                                .where(DispatchedJob.status == "dispatched")).scalar_one()
+        suppression = s.execute(select(func.count()).select_from(SuppressionHash)).scalar_one()
+        drift_crit  = s.execute(select(func.count()).select_from(DriftReport)
+                                .where(DriftReport.severity == "CRITICAL", DriftReport.acknowledged_at.is_(None))).scalar_one()
+        drift_warn  = s.execute(select(func.count()).select_from(DriftReport)
+                                .where(DriftReport.severity == "WARN", DriftReport.acknowledged_at.is_(None))).scalar_one()
 
         # record snapshot (at most one per 5 min - compare to last entry)
-        last = c.execute(
-            "SELECT ts FROM metrics_snapshots ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+        last = s.execute(
+            select(MetricsSnapshot.ts).order_by(MetricsSnapshot.id.desc()).limit(1)
+        ).mappings().first()
         import datetime
         now = datetime.datetime.utcnow()
         should_snap = True
@@ -524,14 +690,17 @@ def overview(session=Depends(require_session)):
             except Exception:
                 pass
         if should_snap:
-            c.execute(
-                "INSERT INTO metrics_snapshots (contacts,campaigns,dispatched,suppression) VALUES (?,?,?,?)",
-                (contacts, campaigns, dispatched, suppression),
+            s.execute(
+                insert(MetricsSnapshot)
+                .values(contacts=contacts, campaigns=campaigns, dispatched=dispatched, suppression=suppression)
+                .execution_options(synchronize_session=False)
             )
 
-        rows = c.execute(
-            "SELECT ts,contacts,campaigns,dispatched,suppression FROM metrics_snapshots ORDER BY id DESC LIMIT 48"
-        ).fetchall()
+        rows = s.execute(
+            select(MetricsSnapshot.ts, MetricsSnapshot.contacts, MetricsSnapshot.campaigns, MetricsSnapshot.dispatched,
+                   MetricsSnapshot.suppression)
+            .order_by(MetricsSnapshot.id.desc()).limit(48)
+        ).mappings().all()
         rows = list(reversed(rows))
 
     chart = _svg_chart(rows)
@@ -539,6 +708,7 @@ def overview(session=Depends(require_session)):
     drift_warn_pill = f'<span class="pill warn"><span class="dot"></span>{drift_warn} warnings</span>' if drift_warn else ''
     sync_ico = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/></svg>'
     dl_ico = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>'
+    sync_card = _sync_card_html()
     body = f"""
 <div class="page-head">
   <div class="titles">
@@ -550,7 +720,7 @@ def overview(session=Depends(require_session)):
     <form method="post" action="/sync/run" style="display:inline">
       <button class="btn">{sync_ico} Run sync now</button>
     </form>
-    <a class="btn" href="/admin/backup/run" title="Run bin/v3 backup from the terminal">{dl_ico} Snapshot to backup</a>
+    <a class="btn" href="/admin/backup/run" title="Invoke the _backup.py helper (see Known limitations in the README)">{dl_ico} Snapshot to backup</a>
   </div>
 </div>
 
@@ -565,7 +735,7 @@ def overview(session=Depends(require_session)):
 <div class="grid" style="grid-template-columns:1.7fr 1fr;align-items:start">
   <div class="card">
     <div class="card-head">
-      <div><h3>Activity</h3><div class="dim" style="margin-top:2px">5-minute snapshots · last 4 hours</div></div>
+      <div><h3>Activity</h3><div class="dim" style="margin-top:2px">5-minute snapshots \u00B7 last 4 hours</div></div>
       <div class="row gap-lg" style="font-size:12px;color:var(--text-muted)">
         <span class="row gap-sm"><span style="width:10px;height:10px;border-radius:3px;background:var(--series-1);display:inline-block"></span>contacts</span>
         <span class="row gap-sm"><span style="width:10px;height:10px;border-radius:3px;background:var(--series-2);display:inline-block"></span>campaigns</span>
@@ -582,12 +752,7 @@ def overview(session=Depends(require_session)):
       <div class="row" style="gap:10px">{drift_crit_pill}{drift_warn_pill}</div>
       <a href="/admin/drift" class="link" style="font-size:12.5px;display:inline-block;margin-top:12px">Review drift report -></a>
     </div>
-    <div class="card pad">
-      <div class="section-title between" style="display:flex;margin-bottom:14px">Sync status <span class="pill ok"><span class="dot"></span>healthy</span></div>
-      <div class="stack" style="gap:11px;font-size:13px">
-        <div class="row between"><span class="muted">WG actor</span><span class="mono cell-dim">{_html.escape(session.get('sub','?')[:20])}</span></div>
-      </div>
-    </div>
+    {sync_card}
   </div>
 </div>
 
@@ -601,7 +766,7 @@ def overview(session=Depends(require_session)):
   fetch('/admin/system/status').then(r=>r.json()).then(function(s){{
     var items=[], warns=[];
     if(!s.bootstrap_ok) warns.push('BOOTSTRAP_TOKEN is not set or is the default value - update your .env before going to production.');
-    if(!s.handshake_done) items.push(['Handshake','Complete the cloud handshake (<code>bin/v3 init-handshake</code>) to enable sending.',false,null]);
+    if(!s.handshake_done) items.push(['Handshake','Sending requires a cloud handshake. Helper: <code>scripts/v3 init-handshake</code> (see Known limitations in the README).',false,null]);
     if(s.entity_count===0) items.push(['Entity','<a href="/admin/entities" class="link">Create your first sending entity</a> (domain + Resend key).',false,'/admin/entities']);
     else if(s.entity_with_key===0) items.push(['API key','<a href="/admin/entities" class="link">Set a Resend API key</a> on your entity.',false,'/admin/entities']);
     if(s.template_count===0) items.push(['Template','<a href="/admin/templates" class="link">Create or import a template</a>.',false,'/admin/templates']);
@@ -612,7 +777,7 @@ def overview(session=Depends(require_session)):
     var el=document.getElementById('setup-checklist');
     var html='<div class="card pad" style="margin-bottom:16px"><div class="section-title" style="margin-bottom:14px">Setup checklist</div>';
     warns.forEach(function(w){{html+='<div class="callout warn" style="margin-bottom:10px">'+w+'</div>';}});
-    items.forEach(function(it){{html+='<div class="row" style="gap:10px;padding:8px 0;border-bottom:1px solid var(--border)"><span style="color:var(--warn-fg);font-size:18px">○</span><div><b>'+it[0]+'</b><br><span class="dim" style="font-size:12.5px">'+it[1]+'</span></div></div>';}});
+    items.forEach(function(it){{html+='<div class="row" style="gap:10px;padding:8px 0;border-bottom:1px solid var(--border)"><span style="color:var(--warn-fg);font-size:18px">\u25CB</span><div><b>'+it[0]+'</b><br><span class="dim" style="font-size:12.5px">'+it[1]+'</span></div></div>';}});
     html+='</div>';
     el.innerHTML=html;
     var sb=document.getElementById('system-status-bar');
@@ -622,7 +787,7 @@ def overview(session=Depends(require_session)):
     sb.innerHTML='<div class="row" style="gap:12px;flex-wrap:wrap;font-size:12.5px;color:var(--text-muted);margin-bottom:4px">'+
       '<span><span class="pill '+(s.handshake_done?'ok':'crit')+'"><span class="dot"></span>Handshake '+(s.handshake_done?'done':'pending')+'</span></span>'+
       '<span><span class="pill '+kpill+'"><span class="dot"></span>K_temp: '+kstr+'</span></span>'+
-      '<span><span class="pill '+(s.using_dev_hmac?'crit':'ok')+'"><span class="dot"></span>HMAC secrets: '+(s.using_dev_hmac?'⚠ dev fallback':'set')+'</span></span>'+
+      '<span><span class="pill '+(s.using_dev_hmac?'crit':'ok')+'"><span class="dot"></span>HMAC secrets: '+(s.using_dev_hmac?'\u26A0 dev fallback':'set')+'</span></span>'+
       '<span><span class="pill '+(s.webhook_24h>0?'ok':'')+'"><span class="dot"></span>Webhooks 24h: '+s.webhook_24h+'</span></span>'+
       '<span><span class="pill '+(s.inbox_pending>0?'warn':'ok')+'"><span class="dot"></span>Inbox pending: '+s.inbox_pending+'</span></span>'+
     '</div>';
@@ -644,11 +809,11 @@ def backup_run(session=Depends(require_session)):
 <div class="page-head"><div class="titles"><h1 class="page-title">Backup</h1></div></div>
 <div class="callout crit" style="max-width:560px">
   <div class="ct-body"><b>BACKUP_PASSPHRASE not set.</b><br>
-  Set it in your <code class="code">.env</code> file and restart the stack, or run manually:<br>
-  <code class="code" style="display:block;margin-top:8px;white-space:pre">bin/v3 backup</code>
+  Set it in your <code class="code">.env</code> file and restart the stack. Backup helper (see Known limitations in the README):<br>
+  <code class="code" style="display:block;margin-top:8px;white-space:pre">scripts/v3 backup</code>
   </div>
 </div>
-<p style="margin-top:16px"><a class="link" href="/admin">← Overview</a></p>
+<p style="margin-top:16px"><a class="link" href="/admin">\u2190 Overview</a></p>
 """
         return _layout("Backup", body, "/admin", session)
 
@@ -671,7 +836,7 @@ def backup_run(session=Depends(require_session)):
 <div class="page-head"><div class="titles"><h1 class="page-title">Backup</h1></div></div>
 <div class="callout {status_cls}" style="margin-bottom:16px"><div class="ct-body"><b>{status_msg}</b></div></div>
 <pre style="background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r);padding:14px;font-size:12px;overflow-x:auto;line-height:1.6">{output}</pre>
-<p style="margin-top:16px"><a class="link" href="/admin">← Overview</a></p>
+<p style="margin-top:16px"><a class="link" href="/admin">\u2190 Overview</a></p>
 """
     return _layout("Backup", body, "/admin", session)
 
@@ -692,8 +857,8 @@ def schedule_view(session=Depends(require_session)):
 
     def _camp_row(r, show_queued=False):
         sp = STATUS_PILL.get(r["status"],"")
-        scheduled_str = (r.get("scheduled_for") or "-")[:16]
-        dispatched_str = (r.get("dispatched_at") or "-")[:16]
+        scheduled_str = _local_time(r.get("scheduled_for"))
+        dispatched_str = _local_time(r.get("dispatched_at"))
         queued_info = f'<span class="cell-dim">{r.get("queued_count",0):,} queued</span>' if show_queued else ""
         return (f'<tr>'
                 f'<td class="cell-strong"><a class="link" href="/admin/campaigns/{r["id"]}/analytics">{_html.escape(r["name"])}</a></td>'
@@ -711,10 +876,10 @@ def schedule_view(session=Depends(require_session)):
         if not rows:
             return f'<div class="section-title">{title}</div><p class="dim" style="margin-bottom:20px">{empty_msg}</p>'
         tbl = "".join(_camp_row(r, show_queued) for r in rows)
-        return (f'<div class="section-title">{title} <span class="count">· {len(rows)}</span></div>'
+        return (f'<div class="section-title">{title} <span class="count">\u00B7 {len(rows)}</span></div>'
                 f'<div class="table-wrap mb"><table class="tbl">'
                 f'<thead><tr><th>Campaign</th><th>Status</th><th>Template</th><th>Entity</th>'
-                f'<th>Scheduled</th><th>Dispatched</th><th></th><th class="actions"></th></tr></thead>'
+                f'<th>Scheduled (<span class="tz-label">UTC</span>)</th><th>Dispatched (<span class="tz-label">UTC</span>)</th><th></th><th class="actions"></th></tr></thead>'
                 f'<tbody>{tbl}</tbody></table></div>')
 
     body = f"""
@@ -722,7 +887,7 @@ def schedule_view(session=Depends(require_session)):
   <div class="titles">
     <div class="eyebrow">Operations</div>
     <h1 class="page-title">Schedule</h1>
-    <p class="page-sub">Upcoming, active, paused and recent campaigns. All times are local to the terminal.</p>
+    <p class="page-sub">Upcoming, active, paused and recent campaigns. Times are shown in your browser's time zone.</p>
   </div>
   <div class="head-actions">
     <a class="btn primary" href="/admin/campaigns">New campaign</a>
@@ -738,11 +903,14 @@ def schedule_view(session=Depends(require_session)):
 
 @router.get("/admin/quicksend", response_class=HTMLResponse)
 def quicksend_view(session=Depends(require_session)):
-    with db.conn() as c:
-        entities = c.execute(
-            "SELECT id, name, from_email, from_name FROM entities WHERE resend_key_enc IS NOT NULL ORDER BY name"
-        ).fetchall()
-        templates = c.execute("SELECT id, name, subject, html_body FROM templates ORDER BY name").fetchall()
+    with db.session() as s:
+        entities = s.execute(
+            select(Entity.id, Entity.name, Entity.from_email, Entity.from_name)
+            .where(Entity.resend_key_enc.is_not(None)).order_by(Entity.name)
+        ).mappings().all()
+        templates = s.execute(
+            select(Template.id, Template.name, Template.subject, Template.html_body).order_by(Template.name)
+        ).mappings().all()
 
     entity_opts = "".join(f'<option value="{r["id"]}">{_html.escape(r["name"])} &lt;{_html.escape(r["from_email"] or "")}&gt;</option>' for r in entities)
     if not entity_opts:
@@ -790,7 +958,7 @@ async function qs_send(){{
   var status=document.getElementById('qs-status');
   var res=document.getElementById('qs-result');
   if(!to||!subject||!body){{status.textContent='Fill in all required fields.';return;}}
-  status.textContent='Sending…';
+  status.textContent='Sending\u2026';
   document.getElementById('qs-btn').disabled=true;
   try{{
     var r=await fetch('/admin/quicksend',{{method:'POST',headers:{{'Content-Type':'application/json'}},
@@ -815,7 +983,7 @@ async function qs_send(){{
 def tags_view(session=Depends(require_session)):
     from mailman.terminal.routes_admin import list_tags_data
     tags = list_tags_data()
-    with db.conn() as c:
+    with db.session() as s:
         all_tags_for_opts = [t["tag"] for t in tags]
     tag_opts = "".join(f'<option value="{_html.escape(t)}">{_html.escape(t)}</option>' for t in all_tags_for_opts)
 
@@ -832,16 +1000,16 @@ def tags_view(session=Depends(require_session)):
                 f'<td class="actions" style="width:44px" onclick="event.stopPropagation()">'
                 f'<div style="position:relative">'
                 f'<button class="btn ghost sm" style="font-size:16px;padding:2px 8px;line-height:1" '
-                f"onclick=\"event.stopPropagation();toggleMenu('{tj}')\" title=\"Actions\">⋮</button>"
+                f"onclick=\"event.stopPropagation();toggleMenu('{tj}')\" title=\"Actions\">\u22EE</button>"
                 f'<div class="tag-menu" id="menu-{te}" style="display:none;position:absolute;right:0;top:100%;z-index:200;'
                 f'background:var(--surface);border:1px solid var(--border-2);border-radius:var(--r);'
                 f'box-shadow:var(--shadow);min-width:180px;padding:4px 0">'
-                f"<button class='tag-menu-item' onclick=\"closeMenus();openRenameModal('{tj}')\">✎ Rename</button>"
-                f"<button class='tag-menu-item' onclick=\"closeMenus();openMergeModal('{tj}')\">⇄ Merge into…</button>"
-                f"<button class='tag-menu-item' onclick=\"closeMenus();openAddModal('{tj}')\">＋ Add to contacts…</button>"
-                f"<button class='tag-menu-item' onclick=\"closeMenus();loadContacts('{tj}')\">👁 View contacts</button>"
+                f"<button class='tag-menu-item' onclick=\"closeMenus();openRenameModal('{tj}')\">\u270E Rename</button>"
+                f"<button class='tag-menu-item' onclick=\"closeMenus();openMergeModal('{tj}')\">\u21C4 Merge into\u2026</button>"
+                f"<button class='tag-menu-item' onclick=\"closeMenus();openAddModal('{tj}')\">\uFF0B Add to contacts\u2026</button>"
+                f"<button class='tag-menu-item' onclick=\"closeMenus();loadContacts('{tj}')\">\U0001F441 View contacts</button>"
                 f'<div style="height:1px;background:var(--border);margin:4px 0"></div>'
-                f"<button class='tag-menu-item' style='color:var(--danger-fg)' onclick=\"closeMenus();openDeleteModal('{tj}',{cnt})\">✕ Remove from all contacts</button>"
+                f"<button class='tag-menu-item' style='color:var(--danger-fg)' onclick=\"closeMenus();openDeleteModal('{tj}',{cnt})\">\u2715 Remove from all contacts</button>"
                 f'</div></div></td>'
                 f'</tr>')
 
@@ -853,7 +1021,7 @@ def tags_view(session=Depends(require_session)):
   <div class="titles">
     <div class="eyebrow">Content</div>
     <h1 class="page-title">Tags</h1>
-    <p class="page-sub">{len(tags)} tags · select a row to act on it, click a row to drill into its contacts.</p>
+    <p class="page-sub">{len(tags)} tags \u00B7 select a row to act on it, click a row to drill into its contacts.</p>
   </div>
 </div>
 
@@ -866,9 +1034,9 @@ def tags_view(session=Depends(require_session)):
 th.sortable{{cursor:pointer;user-select:none}}
 th.sortable:hover{{color:var(--text)}}
 th.sortable .sort-icon{{margin-left:4px;opacity:.4;font-size:10px}}
-th.sortable.asc .sort-icon::after{{content:'▲'}}
-th.sortable.desc .sort-icon::after{{content:'▼'}}
-th.sortable:not(.asc):not(.desc) .sort-icon::after{{content:'⇅'}}
+th.sortable.asc .sort-icon::after{{content:'\u25B2'}}
+th.sortable.desc .sort-icon::after{{content:'\u25BC'}}
+th.sortable:not(.asc):not(.desc) .sort-icon::after{{content:'\u21C5'}}
 .tag-menu-item{{display:block;width:100%;text-align:left;padding:7px 14px;font-size:13px;font-weight:500;background:none;border:none;cursor:pointer;color:var(--text);white-space:nowrap}}
 .tag-menu-item:hover{{background:var(--surface-2)}}
 </style>
@@ -879,7 +1047,7 @@ th.sortable:not(.asc):not(.desc) .sort-icon::after{{content:'⇅'}}
     <div class="row between" style="margin-bottom:8px;gap:10px;flex-wrap:wrap">
       <div style="position:relative;flex:1;min-width:200px">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="position:absolute;left:10px;top:50%;transform:translateY(-50%);pointer-events:none;color:var(--text-dim)"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
-        <input type="search" id="tag-filter" placeholder="Filter tags…" oninput="filterTags()" style="width:100%;padding:7px 10px 7px 32px;border:1px solid var(--border-2);border-radius:var(--r-sm);background:var(--surface);color:var(--text);font-size:13px">
+        <input type="search" id="tag-filter" placeholder="Filter tags\u2026" oninput="filterTags()" style="width:100%;padding:7px 10px 7px 32px;border:1px solid var(--border-2);border-radius:var(--r-sm);background:var(--surface);color:var(--text);font-size:13px">
       </div>
       <button class="btn primary" onclick="openCreatePanel()">+ Create tag</button>
     </div>
@@ -888,8 +1056,8 @@ th.sortable:not(.asc):not(.desc) .sort-icon::after{{content:'⇅'}}
     <div class="tag-toolbar" id="tag-toolbar" style="display:none">
       <span class="tag-toolbar-count" id="toolbar-count"></span>
       <button class="btn sm" id="tb-rename" onclick="toolbarRename()" disabled>Rename</button>
-      <button class="btn sm" id="tb-merge"  onclick="toolbarMerge()"  disabled>Merge into…</button>
-      <button class="btn sm" id="tb-add"    onclick="toolbarAdd()"    disabled>Add to contacts…</button>
+      <button class="btn sm" id="tb-merge"  onclick="toolbarMerge()"  disabled>Merge into\u2026</button>
+      <button class="btn sm" id="tb-add"    onclick="toolbarAdd()"    disabled>Add to contacts\u2026</button>
       <button class="btn sm danger" onclick="toolbarDelete()">Delete</button>
       <button class="btn ghost sm" style="margin-left:auto" onclick="clearSelection()">Clear</button>
     </div>
@@ -913,7 +1081,7 @@ th.sortable:not(.asc):not(.desc) .sort-icon::after{{content:'⇅'}}
     <div class="card pad" id="create-panel" style="display:none">
       <div class="row between" style="margin-bottom:12px">
         <div class="section-title" style="margin:0">Create &amp; assign tag</div>
-        <button class="btn ghost sm" onclick="document.getElementById('create-panel').style.display='none'">✕</button>
+        <button class="btn ghost sm" onclick="document.getElementById('create-panel').style.display='none'">\u2715</button>
       </div>
       <p class="dim" style="font-size:13px;margin-bottom:12px">Add a new tag to all contacts that already have an existing tag, or to all contacts.</p>
       <div class="field"><label>New tag name <span class="req">required</span></label><input type="text" id="new-tag-name" placeholder="vip" class="mono"></div>
@@ -927,11 +1095,11 @@ th.sortable:not(.asc):not(.desc) .sort-icon::after{{content:'⇅'}}
     <div class="card pad" id="contacts-panel" style="display:none">
       <div class="row between" style="margin-bottom:10px">
         <div class="section-title" style="margin:0" id="contacts-panel-title">Contacts</div>
-        <button class="btn ghost sm" onclick="document.getElementById('contacts-panel').style.display='none'">✕</button>
+        <button class="btn ghost sm" onclick="document.getElementById('contacts-panel').style.display='none'">\u2715</button>
       </div>
       <!-- Add contacts to this tag -->
       <div style="margin-bottom:10px;display:flex;gap:6px">
-        <input type="search" id="panel-search" placeholder="Search to add contacts…" style="flex:1;font-size:13px;padding:6px 10px;border:1px solid var(--border-2);border-radius:var(--r-sm);background:var(--surface);color:var(--text)" oninput="panelSearch()">
+        <input type="search" id="panel-search" placeholder="Search to add contacts\u2026" style="flex:1;font-size:13px;padding:6px 10px;border:1px solid var(--border-2);border-radius:var(--r-sm);background:var(--surface);color:var(--text)" oninput="panelSearch()">
       </div>
       <div id="panel-search-results" style="margin-bottom:8px;max-height:140px;overflow-y:auto;font-size:12.5px"></div>
       <div class="divider" style="margin:8px 0"></div>
@@ -1163,6 +1331,7 @@ async function doDelete(){{
   var updated=0;
   for(var i=0;i<tags.length;i++){{
     var r=await fetch('/admin/tags/delete',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{tag:tags[i]}})}});
+    if(!r.ok){{var t=await r.text();var m=t;try{{var e=JSON.parse(t);if(typeof e.detail==='string')m=e.detail;}}catch(x){{}}alert(m||'Error '+r.status);setResult('<div class="callout ok">Removed '+i+' tag(s) from '+updated+' contacts.</div>');return;}}
     var d=await r.json();
     updated+=d.updated||0;
   }}
@@ -1185,9 +1354,11 @@ async function loadContacts(tag){{
   var body=document.getElementById('contacts-panel-body');
   document.getElementById('contacts-panel-title').textContent='"'+tag+'" contacts';
   panel.style.display='';
-  body.innerHTML='<span class="dim">Loading…</span>';
+  body.innerHTML='<span class="dim">Loading\u2026</span>';
   await refreshTaggedContacts();
 }}
+
+function jsAttrQ(s){{return String(s).replace(/\\\\/g,'\\\\\\\\').replace(/'/g,"\\\\'").replace(/&/g,'&amp;').replace(/"/g,'&quot;')}}
 
 async function refreshTaggedContacts(){{
   var body=document.getElementById('contacts-panel-body');
@@ -1200,7 +1371,7 @@ async function refreshTaggedContacts(){{
     return '<div class="row between" style="padding:5px 0;border-bottom:1px solid var(--border);gap:8px">'+
       '<div style="min-width:0"><div class="cell-strong" style="font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+c.email+'</div>'+
       (name?'<div class="dim" style="font-size:11.5px">'+name+'</div>':'')+'</div>'+
-      '<button class="btn ghost sm" style="color:var(--danger-fg);flex-shrink:0;font-size:11px;padding:2px 7px" onclick="removeTagFromContact('+c.id+',\''+c.email.replace(/'/g,"\\'")+"')>✕</button>"+
+      '<button class="btn ghost sm" style="color:var(--danger-fg);flex-shrink:0;font-size:11px;padding:2px 7px" onclick="removeTagFromContact('+c.id+',\\''+jsAttrQ(c.email)+'\\')">X</button>'+
       '</div>';
   }}).join('')+(d.total>200?'<div class="dim" style="margin-top:6px;font-size:11.5px">+'+( d.total-200)+' more</div>':'');
 }}
@@ -1233,7 +1404,7 @@ async function panelSearch(){{
         '<span style="font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">'+c.email+'</span>'+
         (hasTag
           ?'<span class="pill ok" style="font-size:10px;flex-shrink:0">has tag</span>'
-          :'<button class="btn sm" style="flex-shrink:0;font-size:11px;padding:2px 8px" onclick="addTagToContact('+c.id+',\''+c.email.replace(/'/g,"\\'")+'\',\''+c.tags.replace(/'/g,"\\'")+"')>+ Add</button>"
+          :'<button class="btn sm" style="flex-shrink:0;font-size:11px;padding:2px 8px" onclick="addTagToContact('+c.id+',\\''+jsAttrQ(c.email)+'\\',\\''+jsAttrQ(c.tags||'')+'\\')">+ Add</button>'
         )+'</div>';
     }}).join('');
   }},250);
@@ -1273,10 +1444,9 @@ async function createTag(){{
 
 
 @router.post("/admin/tags/delete")
-def tags_delete_post(session=Depends(require_session), tag: str = Form(...)):
-    from mailman.terminal.routes_admin import delete_tag, TagDeleteIn
-    delete_tag(TagDeleteIn(tag=tag))
-    return RedirectResponse("/admin/tags", status_code=303)
+def tags_delete_post(body: TagDeleteIn, session=Depends(require_session)):
+    from mailman.terminal.routes_admin import delete_tag
+    return delete_tag(body)
 
 
 @router.post("/admin/tags/add-to-filtered")
@@ -1289,29 +1459,30 @@ async def tags_add_to_filtered(request: Request, session=Depends(require_session
     if not new_tag:
         return JSONResponse({"error": "new_tag required"}, status_code=400)
     updated = 0
-    with db.conn() as c:
+    with db.session() as s:
         if filter_tag:
-            rows = c.execute(
-                "SELECT id, tags FROM contacts WHERE tags LIKE ?", (f"%{filter_tag}%",)
-            ).fetchall()
+            rows = s.execute(
+                select(Contact.id, Contact.tags).where(Contact.tags.like(f"%{filter_tag}%"))
+            ).mappings().all()
         else:
-            rows = c.execute("SELECT id, tags FROM contacts").fetchall()
+            rows = s.execute(select(Contact.id, Contact.tags)).mappings().all()
         for r in rows:
             existing = [t.strip() for t in (r["tags"] or "").split("|") if t.strip()]
             if new_tag not in existing:
                 existing.append(new_tag)
-                c.execute("UPDATE contacts SET tags=? WHERE id=?", ("|".join(existing), r["id"]))
+                s.execute(update(Contact).where(Contact.id == r["id"]).values(tags="|".join(existing))
+                          .execution_options(synchronize_session=False))
                 updated += 1
-        c.commit()
+        s.commit()
     return JSONResponse({"updated": updated})
 
 
 @router.get("/admin/audit", response_class=HTMLResponse)
 def audit_view(session=Depends(require_session), limit: int = 200):
-    with db.conn() as c:
-        rows = [dict(r) for r in c.execute(
-            "SELECT * FROM audit_event ORDER BY occurred_at DESC LIMIT ?", (limit,)
-        ).fetchall()]
+    with db.session() as s:
+        rows = [dict(r) for r in s.execute(
+            select(*cols(AuditEvent)).order_by(AuditEvent.occurred_at.desc()).limit(limit)
+        ).mappings().all()]
     ACTION_PILL = {
         "terminal.started": "info", "terminal.stopped": "",
         "campaign.launched": "ok", "campaign.paused": "warn", "campaign.cloned": "info",
@@ -1328,7 +1499,7 @@ def audit_view(session=Depends(require_session), limit: int = 200):
         if raw_details:
             try:
                 import json as _j; d = _j.loads(raw_details)
-                detail_str = " · ".join(f"{k}={v}" for k, v in list(d.items())[:3])
+                detail_str = " \u00B7 ".join(f"{k}={v}" for k, v in list(d.items())[:3])
             except Exception:
                 detail_str = str(raw_details)[:60]
         return (f'<tr><td class="cell-dim" style="white-space:nowrap">{(r.get("occurred_at") or "")[:16]}</td>'
@@ -1365,43 +1536,50 @@ def contacts_json(session=Depends(require_session), tag: str = "", q: str = "", 
     """JSON endpoint for contacts - used by tags drill-down panel."""
     from fastapi.responses import JSONResponse
     search = q or tag
-    with db.conn() as c:
+    with db.session() as s:
         if search:
             term = f"%{search}%"
-            rows = c.execute(
-                "SELECT id, email, name, tags FROM contacts WHERE email LIKE ? OR name LIKE ? OR tags LIKE ? ORDER BY created_at DESC LIMIT ?",
-                (term, term, term, limit),
-            ).fetchall()
-            total = c.execute(
-                "SELECT count(*) FROM contacts WHERE email LIKE ? OR name LIKE ? OR tags LIKE ?",
-                (term, term, term),
-            ).fetchone()[0]
+            rows = s.execute(
+                select(Contact.id, Contact.email, Contact.name, Contact.tags)
+                .where(or_(Contact.email.like(term), Contact.name.like(term), Contact.tags.like(term)))
+                .order_by(Contact.created_at.desc()).limit(limit)
+            ).mappings().all()
+            total = s.execute(
+                select(func.count()).select_from(Contact)
+                .where(or_(Contact.email.like(term), Contact.name.like(term), Contact.tags.like(term)))
+            ).scalar_one()
         else:
-            rows = c.execute("SELECT id, email, name, tags FROM contacts ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
-            total = c.execute("SELECT count(*) FROM contacts").fetchone()[0]
+            rows = s.execute(
+                select(Contact.id, Contact.email, Contact.name, Contact.tags).order_by(Contact.created_at.desc()).limit(limit)
+            ).mappings().all()
+            total = s.execute(select(func.count()).select_from(Contact)).scalar_one()
     return JSONResponse({"contacts": [dict(r) for r in rows], "total": total})
 
 
 @router.get("/admin/contacts", response_class=HTMLResponse)
 def contacts_view(session=Depends(require_session), tag: str = "", q: str = ""):
     search = q or tag  # q is new search param; tag kept for backward compat
-    with db.conn() as c:
+    with db.session() as s:
         if search:
             term = f"%{search}%"
-            rows = c.execute(
-                "SELECT id, email, name, tags, created_at FROM contacts "
-                "WHERE email LIKE ? OR name LIKE ? OR tags LIKE ? ORDER BY created_at DESC LIMIT 300",
-                (term, term, term),
-            ).fetchall()
+            rows = s.execute(
+                select(Contact.id, Contact.email, Contact.name, Contact.tags, Contact.created_at)
+                .where(or_(Contact.email.like(term), Contact.name.like(term), Contact.tags.like(term)))
+                .order_by(Contact.created_at.desc()).limit(300)
+            ).mappings().all()
         else:
-            rows = c.execute("SELECT id, email, name, tags, created_at FROM contacts ORDER BY created_at DESC LIMIT 300").fetchall()
+            rows = s.execute(
+                select(Contact.id, Contact.email, Contact.name, Contact.tags, Contact.created_at)
+                .order_by(Contact.created_at.desc()).limit(300)
+            ).mappings().all()
     trash_svg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>'
     edit_svg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" width="13" height="13"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>'
     # Load campaign list for "add to campaign" modal
-    with db.conn() as cc:
-        campaigns_for_modal = cc.execute(
-            "SELECT id, name FROM campaigns WHERE status NOT IN ('archived') ORDER BY created_at DESC LIMIT 50"
-        ).fetchall()
+    with db.session() as ss:
+        campaigns_for_modal = ss.execute(
+            select(Campaign.id, Campaign.name).where(Campaign.status.not_in(("archived",)))
+            .order_by(Campaign.created_at.desc()).limit(50)
+        ).mappings().all()
     camp_opts = "".join(f'<option value="{c["id"]}">{_html.escape(c["name"])}</option>' for c in campaigns_for_modal)
 
     def _contact_row(r) -> str:
@@ -1487,7 +1665,7 @@ def contacts_view(session=Depends(require_session), tag: str = "", q: str = ""):
       const dataCount = hasHeader ? lines.length - 1 : lines.length;
       const chunks = Math.ceil(dataCount / CHUNK);
       info.style.display = '';
-      info.textContent = dataCount.toLocaleString() + ' rows' + (chunks > 1 ? ' · will split into ' + chunks + ' chunks' : '');
+      info.textContent = dataCount.toLocaleString() + ' rows' + (chunks > 1 ? ' \u00B7 will split into ' + chunks + ' chunks' : '');
       document.getElementById('csv-btn').disabled = false;
     }};
     reader.readAsText(inp.files[0]);
@@ -1528,7 +1706,7 @@ async function csvUpload() {{
   let imp = 0, sup = 0, inv = 0, errs = [];
   for (let i = 0; i < chunks.length; i++) {{
     bar.style.width = Math.round((i / chunks.length) * 100) + '%';
-    status.textContent = 'Chunk ' + (i+1) + ' / ' + chunks.length + ' · imported so far: ' + imp.toLocaleString();
+    status.textContent = 'Chunk ' + (i+1) + ' / ' + chunks.length + ' \u00B7 imported so far: ' + imp.toLocaleString();
     const fd = new FormData();
     const chunk = chunks[i];
     if (chunk && chunk.isBlob) {{
@@ -1547,9 +1725,9 @@ async function csvUpload() {{
   }}
   bar.style.width = '100%';
   status.textContent = 'Done.';
-  const errHtml = errs.length ? '<div class="dim" style="margin-top:6px;font-size:12px">' + errs.slice(0,10).map(e => '⚠ ' + e).join('<br>') + '</div>' : '';
+  const errHtml = errs.length ? '<div class="dim" style="margin-top:6px;font-size:12px">' + errs.slice(0,10).map(e => '\u26A0 ' + e).join('<br>') + '</div>' : '';
   result.style.display = '';
-  result.innerHTML = '<div class="callout ok" style="margin-top:10px"><div class="ct-body"><b>Imported ' + imp.toLocaleString() + ' contacts.</b><div class="dim" style="margin-top:4px">Skipped ' + sup + ' suppressed · ' + inv + ' invalid' + (errs.length ? ' · ' + errs.length + ' errors' : '') + '</div>' + errHtml + '</div></div>';
+  result.innerHTML = '<div class="callout ok" style="margin-top:10px"><div class="ct-body"><b>Imported ' + imp.toLocaleString() + ' contacts.</b><div class="dim" style="margin-top:4px">Skipped ' + sup + ' suppressed \u00B7 ' + inv + ' invalid' + (errs.length ? ' \u00B7 ' + errs.length + ' errors' : '') + '</div>' + errHtml + '</div></div>';
   btn.disabled = false;
   inp.value = '';
   document.getElementById('csv-info').textContent = '';
@@ -1559,7 +1737,7 @@ async function csvUpload() {{
 
 <div class="row between mb" style="flex-wrap:wrap;gap:10px">
   <div class="row" style="gap:8px;align-items:center">
-    <div class="section-title" style="margin:0">Contact list <span class="count">· {total:,}</span></div>
+    <div class="section-title" style="margin:0">Contact list <span class="count">\u00B7 {total:,}</span></div>
     <span id="bulk-bar" style="display:none;gap:8px;align-items:center" class="row">
       <span id="bulk-count" class="dim" style="font-size:12.5px"></span>
       <button class="btn sm" onclick="bulkExport()">Export</button>
@@ -1570,8 +1748,8 @@ async function csvUpload() {{
   </div>
   <div class="row" style="gap:8px;flex-wrap:wrap">
     <form method="get" action="/admin/contacts" style="display:flex;gap:6px;align-items:center">
-      <input type="search" name="q" id="contact-q" value="{_html.escape(tag)}" placeholder="Search email, name, tag…" style="width:220px" oninput="this.form.submit()">
-      {'<a class="btn ghost sm" href="/admin/contacts">✕</a>' if tag else ''}
+      <input type="search" name="q" id="contact-q" value="{_html.escape(tag)}" placeholder="Search email, name, tag\u2026" style="width:220px" oninput="this.form.submit()">
+      {'<a class="btn ghost sm" href="/admin/contacts">\u2715</a>' if tag else ''}
     </form>
     <a class="btn ghost sm" href="/admin/contacts/export" id="export-all-btn">{dl_svg} Export CSV</a>
     {_help_btn("contacts-import-help")}
@@ -1619,6 +1797,7 @@ async function addToCampaign(){{
   var ids=Array.from(document.querySelectorAll('.bulk-cb:checked')).map(function(c){{return parseInt(c.value);}});
   if(!cid||!ids.length)return;
   var r=await fetch('/admin/contacts/add-to-campaign',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{campaign_id:parseInt(cid),contact_ids:ids}})}});
+  if(!r.ok){{var t=await r.text();var m=t;try{{var e=JSON.parse(t);if(typeof e.detail==='string')m=e.detail;}}catch(x){{}}alert(m||'Error '+r.status);return;}}
   var d=await r.json();
   document.getElementById('modal-add-to-camp').classList.remove('open');
   alert('Added '+d.added+' contacts to campaign.');
@@ -1643,7 +1822,7 @@ async function saveContact(){{
 <!-- Contact edit modal -->
 <div class="modal-overlay" id="modal-edit-contact" onclick="if(event.target===this)this.classList.remove('open')">
 <div class="modal">
-  <div class="modal-head"><h3>Edit contact</h3><button class="icon-btn" onclick="document.getElementById('modal-edit-contact').classList.remove('open')">✕</button></div>
+  <div class="modal-head"><h3>Edit contact</h3><button class="icon-btn" onclick="document.getElementById('modal-edit-contact').classList.remove('open')">\u2715</button></div>
   <div class="modal-body">
     <input type="hidden" id="edit-contact-id">
     <div class="field"><label>Name</label><input type="text" id="edit-contact-name" placeholder="Jane Doe"></div>
@@ -1655,7 +1834,7 @@ async function saveContact(){{
 <!-- Add to campaign modal -->
 <div class="modal-overlay" id="modal-add-to-camp" onclick="if(event.target===this)this.classList.remove('open')">
 <div class="modal">
-  <div class="modal-head"><h3>Add to campaign</h3><button class="icon-btn" onclick="document.getElementById('modal-add-to-camp').classList.remove('open')">✕</button></div>
+  <div class="modal-head"><h3>Add to campaign</h3><button class="icon-btn" onclick="document.getElementById('modal-add-to-camp').classList.remove('open')">\u2715</button></div>
   <div class="modal-body">
     <p class="dim" style="margin-bottom:12px">Add selected contacts as recipients to an existing campaign.</p>
     <div class="field"><label>Campaign</label><select id="atc-camp-select">{camp_opts}</select></div>
@@ -1728,15 +1907,9 @@ async def contact_edit(contact_id: int, request: Request, session=Depends(requir
 
 
 @router.post("/admin/contacts/add-to-campaign")
-async def contacts_add_to_campaign(request: Request, session=Depends(require_session)):
-    from fastapi.responses import JSONResponse
-    from mailman.terminal.routes_admin import add_contacts_to_campaign, AddToCampaignIn
-    try:
-        data = await request.json()
-        result = add_contacts_to_campaign(AddToCampaignIn(**data))
-        return JSONResponse(result)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+def contacts_add_to_campaign(body: AddToCampaignIn, session=Depends(require_session)):
+    from mailman.terminal.routes_admin import add_contacts_to_campaign
+    return add_contacts_to_campaign(body)
 
 
 @router.post("/admin/contacts/{cid}/delete")
@@ -1751,8 +1924,8 @@ def contacts_delete(cid: int, session=Depends(require_session)):
 
 @router.get("/admin/templates", response_class=HTMLResponse)
 def templates_view(session=Depends(require_session), ok: str = "", error: str = ""):
-    with db.conn() as c:
-        rows = c.execute("SELECT * FROM templates ORDER BY updated_at DESC").fetchall()
+    with db.session() as s:
+        rows = s.execute(select(*cols(Template)).order_by(Template.updated_at.desc())).mappings().all()
     eye_svg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>'
     def _tmpl_row(r) -> str:
         return (f'<tr>'
@@ -1769,7 +1942,7 @@ def templates_view(session=Depends(require_session), ok: str = "", error: str = 
                 f'</div></td></tr>')
     table_rows = "".join(_tmpl_row(r) for r in rows) or '<tr><td colspan=7 class="empty" style="padding:32px">No templates yet.</td></tr>'
     VARS = [("{{firstName}}", "Jane"), ("{{name}}", "Jane Doe"), ("{{email}}", "jane@example.com"),
-            ("{{unsubscribeUrl}}", "https://…/u/…"), ("{{erasureUrl}}", "https://…/e/…"), ("{{companyName}}", "MailMan")]
+            ("{{unsubscribeUrl}}", "https://.../u/..."), ("{{erasureUrl}}", "https://.../e/..."), ("{{companyName}}", _SAMPLE_COMPANY)]
     vars_html = "".join(
         f'<div class="row between" style="font-size:12.5px;padding:5px 0;border-bottom:1px solid var(--border)">'
         f'<code class="code">{v[0]}</code><span class="dim" style="font-family:var(--font-mono)">{v[1]}</span></div>'
@@ -1796,7 +1969,7 @@ def templates_view(session=Depends(require_session), ok: str = "", error: str = 
 
 <div class="row between mb" style="align-items:center;flex-wrap:wrap;gap:10px">
   <div class="row" style="gap:8px;align-items:center">
-    <div class="section-title" style="margin:0">All templates <span class="count">· {len(rows)}</span></div>
+    <div class="section-title" style="margin:0">All templates <span class="count">\u00B7 {len(rows)}</span></div>
     <span id="tmpl-bulk-bar" style="display:none;gap:8px;align-items:center" class="row">
       <span id="tmpl-bulk-count" class="dim" style="font-size:12.5px"></span>
       <button class="btn sm" onclick="tmplExportSelected()">Export selected</button>
@@ -1855,15 +2028,11 @@ function tmplExportSelected(){{
     <div class="form-grid">
       <div class="field"><label for="tn">Name <span class="hint">required</span></label><input type="text" id="tn" name="name" required placeholder="Welcome - v2"></div>
       <div class="field"><label for="tf">From name <span class="hint">required</span></label><input type="text" id="tf" name="from_name" required placeholder="The MailMan team"></div>
-      <div class="field span-2"><label for="ts">Subject <span class="hint">required</span></label><input type="text" id="ts" name="subject" required placeholder="Welcome aboard, {{{{firstName}}}} 👋"></div>
+      <div class="field span-2"><label for="ts">Subject <span class="hint">required</span></label><input type="text" id="ts" name="subject" required placeholder="Welcome aboard, {{{{firstName}}}} \U0001F44B"></div>
       <div class="field span-2">
-        <div class="label-row"><label for="tb">HTML body</label><button type="button" class="btn ghost sm" onclick="insertBadge('tb')" title="Prepend a security badge to your email">✦ Insert security badge</button></div>
+        <div class="label-row"><label for="tb">HTML body</label></div>
         <textarea id="tb" name="html_body" class="mono" required placeholder="&lt;h1&gt;Hi {{{{firstName}}}}&lt;/h1&gt;&#10;&lt;p&gt;Thanks for joining.&lt;/p&gt;&#10;&lt;a href=&quot;{{{{unsubscribeUrl}}}}&quot;&gt;Unsubscribe&lt;/a&gt;"></textarea>
       </div>
-<script>
-var BADGE_HTML = "<div style='display:inline-block;background:#ede9fe;color:#5b21b6;font-size:11px;font-weight:600;padding:3px 10px;border-radius:99px;letter-spacing:.04em;margin-bottom:20px'>✦ ENCRYPTED END-TO-END</div>\\n";
-function insertBadge(id){{var el=document.getElementById(id);if(!el)return;if(el.value.indexOf('ENCRYPTED END-TO-END')===-1){{el.value=BADGE_HTML+el.value;}}if(typeof schedulePreview==='function')schedulePreview();}}
-</script>
     </div>
     <div class="form-actions" style="margin-top:14px"><button class="btn primary" type="submit">Create template</button><span class="dim">Tracking enabled by default</span></div>
   </form>
@@ -1896,23 +2065,23 @@ function insertBadge(id){{var el=document.getElementById(id);if(!el)return;if(el
 @router.get("/admin/templates/{tid}/preview", response_class=HTMLResponse)
 def template_preview(tid: int, name: str = "Jane Doe", email: str = "jane@example.com",
                      contact_id: int = 0, session=Depends(require_session)):
-    with db.conn() as c:
-        tmpl = c.execute("SELECT * FROM templates WHERE id=?", (tid,)).fetchone()
+    with db.session() as s:
+        tmpl = s.execute(select(*cols(Template)).where(Template.id == tid)).mappings().first()
         # Load real contact if requested
         if contact_id:
-            rc = c.execute("SELECT email, name FROM contacts WHERE id=?", (contact_id,)).fetchone()
+            rc = s.execute(select(Contact.email, Contact.name).where(Contact.id == contact_id)).mappings().first()
             if rc:
                 email = rc["email"]
                 name  = rc["name"] or email
-        sample_contacts = c.execute(
-            "SELECT id, email, name FROM contacts ORDER BY id DESC LIMIT 30"
-        ).fetchall()
+        sample_contacts = s.execute(
+            select(Contact.id, Contact.email, Contact.name).order_by(Contact.id.desc()).limit(30)
+        ).mappings().all()
     if not tmpl:
         return RedirectResponse("/admin/templates", status_code=303)
     t = dict(tmpl)
     from mailman.terminal.launch import _render, _inject_compliance
     contact = {"email": email, "name": name}
-    subject, rendered_html, rendered_text = _render(t, contact)
+    subject, rendered_html, rendered_text = _render(t, contact, _SAMPLE_COMPANY)
     preview_html, _ = _inject_compliance(rendered_html, rendered_text,
                                           "https://example.com/unsub", "https://example.com/erasure",
                                           "promotional")
@@ -1922,7 +2091,7 @@ def template_preview(tid: int, name: str = "Jane Doe", email: str = "jane@exampl
     info_svg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>'
     back_svg = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>'
     VARS = [("{{firstName}}", "Jane"), ("{{name}}", "Jane Doe"), ("{{email}}", "jane@example.com"),
-            ("{{unsubscribeUrl}}", "https://…/u/…"), ("{{erasureUrl}}", "https://…/e/…"), ("{{companyName}}", "MailMan")]
+            ("{{unsubscribeUrl}}", "https://.../u/..."), ("{{erasureUrl}}", "https://.../e/..."), ("{{companyName}}", _SAMPLE_COMPANY)]
     vars_html = "".join(
         f'<div class="row between" style="font-size:11.5px;padding:4px 0;border-bottom:1px solid var(--border)">'
         f'<code class="code">{v[0]}</code><span class="dim">{v[1]}</span></div>'
@@ -1932,6 +2101,7 @@ def template_preview(tid: int, name: str = "Jane Doe", email: str = "jane@exampl
         f'<option value="{c["id"]}" data-email="{_html.escape(c["email"])}" data-name="{_html.escape(c["name"] or "")}">{_html.escape(c["email"])}</option>'
         for c in sample_contacts
     )
+    badge_warn = (f'<div class="callout warn" style="margin-bottom:16px">{_html.escape(_OLD_BADGE_WARNING)}</div>' if _OLD_BADGE in (t.get("html_body") or "") else "")
     body = f"""
 <div class="row" style="gap:8px;margin-bottom:14px">
   <a class="link muted" href="/admin/templates" style="display:inline-flex;align-items:center;gap:5px;font-size:12.5px">{back_svg} Templates</a>
@@ -1943,6 +2113,7 @@ def template_preview(tid: int, name: str = "Jane Doe", email: str = "jane@exampl
     <p class="page-sub">Live preview updates as you type. Edit the template body below and save - the preview refreshes instantly.</p>
   </div>
 </div>
+{badge_warn}
 
 <div class="grid" style="grid-template-columns:minmax(260px,320px) 1fr;align-items:start;gap:20px">
   <div class="stack" style="gap:16px">
@@ -1984,8 +2155,8 @@ def template_preview(tid: int, name: str = "Jane Doe", email: str = "jane@exampl
       <div class="card-head" style="display:flex;align-items:center;justify-content:space-between">
         <h3>Live preview</h3>
         <div class="row" style="gap:6px">
-          <button class="btn ghost sm" id="view-desktop" onclick="setViewport('desktop')" title="Desktop">🖥</button>
-          <button class="btn ghost sm" id="view-mobile" onclick="setViewport('mobile')" title="Mobile (375px)">📱</button>
+          <button class="btn ghost sm" id="view-desktop" onclick="setViewport('desktop')" title="Desktop">\U0001F5A5</button>
+          <button class="btn ghost sm" id="view-mobile" onclick="setViewport('mobile')" title="Mobile (375px)">\U0001F4F1</button>
           <span id="preview-status" class="dim" style="font-size:12px"></span>
         </div>
       </div>
@@ -1999,7 +2170,7 @@ def template_preview(tid: int, name: str = "Jane Doe", email: str = "jane@exampl
           <div class="field"><label>From name</label><input type="text" name="from_name" value="{_html.escape(t.get('from_name',''))}" required></div>
           <div class="field span-2"><label>Subject</label><input type="text" name="subject" value="{_html.escape(t.get('subject',''))}" required></div>
           <div class="field span-2">
-            <div class="label-row"><label>HTML body</label><button type="button" class="btn ghost sm" onclick="insertBadge('html-body-input')" title="Prepend security badge">✦ Insert security badge</button></div>
+            <div class="label-row"><label>HTML body</label></div>
             <textarea name="html_body" class="mono" id="html-body-input" style="min-height:220px" oninput="schedulePreview()">{html_body_escaped}</textarea>
           </div>
         </div>
@@ -2019,7 +2190,7 @@ async function updatePreview() {{
   const e = encodeURIComponent(document.getElementById('pe').value || 'jane@example.com');
   const body = document.getElementById('html-body-input')?.value;
   const status = document.getElementById('preview-status');
-  status.textContent = 'updating…';
+  status.textContent = 'updating\u2026';
   try {{
     let url = '/admin/templates/{tid}/preview/raw?name=' + n + '&email=' + e;
     let opts = {{}};
@@ -2056,8 +2227,8 @@ async def template_preview_raw(tid: int, name: str = "Jane Doe", email: str = "j
                                 session=Depends(require_session),
                                 html_body: str = Form(None)):
     from fastapi.responses import Response
-    with db.conn() as c:
-        tmpl = c.execute("SELECT * FROM templates WHERE id=?", (tid,)).fetchone()
+    with db.session() as s:
+        tmpl = s.execute(select(*cols(Template)).where(Template.id == tid)).mappings().first()
     if not tmpl:
         return Response("not found", status_code=404, media_type="text/plain")
     from mailman.terminal.launch import _render, _inject_compliance
@@ -2065,7 +2236,7 @@ async def template_preview_raw(tid: int, name: str = "Jane Doe", email: str = "j
     if html_body is not None:
         t = {**t, "html_body": html_body}
     contact = {"email": email, "name": name}
-    _, rendered_html, rendered_text = _render(t, contact)
+    _, rendered_html, rendered_text = _render(t, contact, _SAMPLE_COMPANY)
     preview_html, _ = _inject_compliance(rendered_html, rendered_text,
                                           "https://example.com/unsub", "https://example.com/erasure",
                                           "promotional")
@@ -2160,22 +2331,25 @@ async def templates_import(session=Depends(require_session),
 
 @router.get("/admin/campaigns", response_class=HTMLResponse)
 def campaigns_view(session=Depends(require_session)):
-    with db.conn() as c:
-        camps = c.execute(
-            "SELECT c.id, c.name, c.kind, c.status, c.recipient_count, c.dispatched_at, c.scheduled_for, "
-            "co.name AS entity_name, "
-            "(SELECT count(*) FROM campaign_stages WHERE campaign_id=c.id) AS stage_count "
-            "FROM campaigns c LEFT JOIN entities co ON co.id=c.entity_id ORDER BY c.created_at DESC"
-        ).fetchall()
-        templates = c.execute("SELECT id, name FROM templates ORDER BY name").fetchall()
-        entities = c.execute("SELECT id, name FROM entities ORDER BY name").fetchall()
+    with db.session() as s:
+        c, co = aliased(Campaign), aliased(Entity)
+        camps = s.execute(
+            select(c.id, c.name, c.template_id, c.kind, c.status, c.recipient_count, c.dispatched_at, c.scheduled_for, c.relaunch_seq,
+                   co.name.label("entity_name"),
+                   select(func.count()).select_from(CampaignStage).where(CampaignStage.campaign_id == c.id)
+                   .scalar_subquery().label("stage_count"), c.relaunch_open, select(func.count()).select_from(CampaignBatch).where(CampaignBatch.campaign_id == c.id, CampaignBatch.dispatch_started_at.is_not(None)).scalar_subquery().label("open_batches"))
+            .outerjoin(co, co.id == c.entity_id).order_by(c.created_at.desc())
+        ).mappings().all()
+        templates = s.execute(select(Template.id, Template.name).order_by(Template.name)).mappings().all()
+        badge_tids = set(s.execute(select(Template.id).where(func.instr(Template.html_body, _OLD_BADGE) > 0)).scalars().all())
+        entities = s.execute(select(Entity.id, Entity.name).order_by(Entity.name)).mappings().all()
     tmpl_opts = "".join(f"<option value='{t['id']}'>{_html.escape(t['name'])}</option>" for t in templates)
     co_opts = "<option value=''>- global (use settings key) -</option>" + "".join(
         f"<option value='{co['id']}'>{_html.escape(co['name'])}</option>" for co in entities
     )
     STATUS_PILL = {"draft": "", "tested": "info", "scheduled": "accent", "dispatched": "ok", "paused": "warn", "failed": "crit"}
-    with db.conn() as cc:
-        entities_for_edit = cc.execute("SELECT id, name FROM entities ORDER BY name").fetchall()
+    with db.session() as ss:
+        entities_for_edit = ss.execute(select(Entity.id, Entity.name).order_by(Entity.name)).mappings().all()
     ent_edit_opts = "<option value=''>- global -</option>" + "".join(
         f'<option value="{e["id"]}">{_html.escape(e["name"])}</option>' for e in entities_for_edit)
 
@@ -2185,39 +2359,41 @@ def campaigns_view(session=Depends(require_session)):
         st = r["status"]
         if st == "archived":
             return ""  # hide archived by default
-        is_sent     = st in ("dispatched", "sent", "sending", "cancelled")
-        launch_btn  = (f'<button class="btn sm primary" onclick="launchCampaign({cid},this,true)">Re-launch</button>'
+        is_sent     = st in ("dispatched", "sent", "sending", "cancelled") or (st != "paused" and bool(r["relaunch_open"] or r["open_batches"]))
+        ob = "1" if r["template_id"] in badge_tids else "0"
+        launch_btn  = (f'<button class="btn sm primary" data-seq="{r["relaunch_seq"]}" data-old-badge="{ob}" onclick="launchCampaign({cid},this,true)">Re-launch</button>'
                        if is_sent else
-                       f'<button class="btn sm primary" onclick="launchCampaign({cid},this,false)">Launch</button>')
-        pause_btn   = (f'<button class="btn ghost sm" title="Pause" onclick="campAction({cid},\'pause\')">⏸</button>') if st in ("dispatched","scheduled","tested") else ""
-        resume_btn  = (f'<button class="btn ghost sm" title="Resume" onclick="campAction({cid},\'resume\')">▶</button>') if st == "paused" else ""
-        clone_btn   = (f'<button class="btn ghost sm" title="Clone" onclick="campAction({cid},\'clone\')">⧉</button>')
-        archive_btn = (f'<button class="btn ghost sm" title="Archive" style="color:var(--text-dim)" onclick="if(confirm(\'Archive?\'))campAction({cid},\'archive\')">⊡</button>') if st in ("dispatched","failed","cancelled") else ""
+                       f'<button class="btn sm primary" data-old-badge="{ob}" onclick="launchCampaign({cid},this,false)">Launch</button>')
+        schedule_btn = (f'<button class="btn sm" data-old-badge="{ob}" onclick="openSchedule({cid},this)">Schedule</button>'
+                        if st == "tested" and not is_sent else "")
+        pause_btn   = (f'<button class="btn ghost sm" title="Pause" onclick="campAction({cid},\'pause\')">\u23F8</button>') if st in ("dispatched","scheduled","tested") else ""
+        resume_btn  = (f'<button class="btn ghost sm" title="Resume" onclick="campAction({cid},\'resume\')">\u25B6</button>') if st == "paused" else ""
+        clone_btn   = (f'<button class="btn ghost sm" title="Clone" onclick="campAction({cid},\'clone\')">\u29C9</button>')
+        archive_btn = (f'<button class="btn ghost sm" title="Archive" style="color:var(--text-dim)" onclick="if(confirm(\'Archive?\'))campAction({cid},\'archive\')">\u22A1</button>') if st in ("dispatched","failed","cancelled") else ""
         name_esc = _html.escape(r["name"])
         rd = dict(r)
         ent_id = rd.get("entity_id") or ""
         rl = rd.get("rate_limit_per_min") or ""
         sc = rd.get("stage_count") or 0
         stage_badge = (f' <span class="pill info" style="font-size:10px;padding:1px 7px">'
-                       f'📅 {sc} stages</span>') if sc else ""
+                       f'\U0001F4C5 {sc} stages</span>') if sc else ""
         rid = r["id"]
         archive_menu_item = (f'<button class="more-menu-item" onclick="if(confirm(\'Archive?\'))campAction({cid},\'archive\')">Archive</button>'
                              if st in ("dispatched", "failed", "cancelled") else "")
         return (f'<tr><td class="cell-dim mono">{rid}</td>'
-                f"<td class='cell-strong'><button class='btn ghost sm' style='padding:2px 6px;font-size:12px' onclick=\"editCampaign({rid},'{name_esc}','{ent_id}','{rl}')\">✎</button> {name_esc}{stage_badge}</td>"
+                f"<td class='cell-strong'><button class='btn ghost sm' style='padding:2px 6px;font-size:12px' onclick=\"editCampaign({rid},'{name_esc}','{ent_id}','{rl}')\">\u270E</button> {name_esc}{stage_badge}</td>"
                 f'<td class="cell-dim">{r["kind"]}</td>'
                 f'<td><span class="pill {sp}"><span class="dot"></span>{st}</span></td>'
                 f'<td class="cell-dim">{_html.escape(r["entity_name"] or "-")}</td>'
                 f'<td class="num cell-dim">{r["recipient_count"]}</td>'
-                f'<td class="cell-dim">{(r["scheduled_for"] or "")[:16] or "-"}</td>'
-                f'<td class="cell-dim">{(r["dispatched_at"] or "")[:16] or "-"}</td>'
+                f'<td class="cell-dim">{_local_time(r["scheduled_for"])}</td>'
+                f'<td class="cell-dim">{_local_time(r["dispatched_at"])}</td>'
                 f'<td class="actions"><div class="row-actions">'
-                f'{launch_btn}'
+                f'{launch_btn}{schedule_btn}'
                 f"<button class='btn sm' onclick=\"openTestSend({rid},'{name_esc}',{ent_id or 'null'})\">Test</button>"
-                f'<button class="btn sm" onclick="campAction({cid},\'mark-tested\')">✓</button>'
                 f'{pause_btn}{resume_btn}{clone_btn}'
                 f'<div class="more-menu" style="position:relative;display:inline-block">'
-                f'<button class="btn ghost sm" onclick="event.stopPropagation();toggleMenu(\'cm{rid}\')" title="More">⋯</button>'
+                f'<button class="btn ghost sm" onclick="event.stopPropagation();toggleMenu(\'cm{rid}\')" title="More">\u22EF</button>'
                 f'<div id="cm{rid}" class="more-menu-dd" style="display:none;position:absolute;right:0;top:100%;z-index:100;background:var(--surface);border:1px solid var(--border);border-radius:6px;box-shadow:var(--shadow-sm);min-width:150px;padding:4px 0">'
                 f'<a class="more-menu-item" href="/admin/campaigns/{r["id"]}/recipients">Recipients</a>'
                 f'<a class="more-menu-item" href="/admin/campaigns/{r["id"]}/analytics">Analytics</a>'
@@ -2230,19 +2406,19 @@ def campaigns_view(session=Depends(require_session)):
   <div class="titles">
     <div class="eyebrow">Lifecycle</div>
     <h1 class="page-title">Campaigns</h1>
-    <p class="page-sub">Create -> add recipients -> mark tested -> launch. The template-hash gate blocks launch if the template changed after testing.</p>
+    <p class="page-sub">Create -> add recipients -> mark tested -> launch now or schedule it. The template-hash gate blocks launch if the template changed after testing.</p>
   </div>
 </div>
 
 <div class="grid mb" style="grid-template-columns:1.4fr 1fr;align-items:start">
-  <form class="form" method="post" action="/admin/campaigns/create">
+  <form class="form" method="post" action="/admin/campaigns/create" onsubmit="return _utcSubmit('cs','cs-utc')">
     <div class="section-title">Create campaign</div>
     <div class="form-grid">
       <div class="field span-2"><label for="cn">Name <span class="hint">required</span></label><input type="text" id="cn" name="name" required placeholder="June feature launch"></div>
       <div class="field"><label for="ct">Template</label><select id="ct" name="template_id" required>{tmpl_opts}</select></div>
       <div class="field"><label for="ck">Kind</label><select id="ck" name="kind"><option value="promotional">promotional</option><option value="transactional">transactional</option></select></div>
       <div class="field"><label for="cc">Entity</label><select id="cc" name="entity_id">{co_opts}</select></div>
-      <div class="field"><label for="cs">Schedule <span class="hint">optional</span></label><input type="datetime-local" id="cs" name="scheduled_for"></div>
+      <div class="field"><label for="cs">Schedule <span class="hint">optional (<span class="tz-label">UTC</span>)</span></label><input type="datetime-local" id="cs" name="scheduled_for"><input type="hidden" id="cs-utc"></div>
       <div class="field"><label for="crl">Rate limit <span class="hint">emails / min - blank = unlimited</span></label><input type="number" id="crl" name="rate_limit_per_min" min="1" max="10000" placeholder="e.g. 60"></div>
       <div class="field"><label for="cbp">Bounce pause threshold <span class="hint">0.05 = 5% triggers halving</span></label><input type="number" id="cbp" name="bounce_pause_pct" min="0.01" max="1" step="0.01" value="0.10"></div>
       <div class="field span-2" style="border-top:1px solid var(--border);padding-top:14px;margin-top:2px">
@@ -2278,7 +2454,7 @@ def campaigns_view(session=Depends(require_session)):
 
 <div class="table-wrap">
   <table class="tbl">
-    <thead><tr><th>ID</th><th>Name</th><th>Kind</th><th>Status</th><th>Entity</th><th class="num">Recipients</th><th>Scheduled</th><th>Dispatched</th><th class="actions"></th></tr></thead>
+    <thead><tr><th>ID</th><th>Name</th><th>Kind</th><th>Status</th><th>Entity</th><th class="num">Recipients</th><th>Scheduled (<span class="tz-label">UTC</span>)</th><th>Dispatched (<span class="tz-label">UTC</span>)</th><th class="actions"></th></tr></thead>
     <tbody>{table_rows}</tbody>
   </table>
 </div>
@@ -2293,7 +2469,7 @@ function calcTime() {{
   const mx  = parseInt(document.getElementById('hs-max').value)    || 210;
   const rec = parseInt(document.getElementById('hs-recip').value)  || 100;
   const el  = document.getElementById('hs-estimate');
-  if (mn > mx) {{ el.style.display=''; el.innerHTML='<span class="crit">Min must be ≤ max</span>'; return; }}
+  if (mn > mx) {{ el.style.display=''; el.innerHTML='<span class="crit">Min must be \u2264 max</span>'; return; }}
   const avgDelay = (mn + mx) / 2;
   const groups   = Math.ceil(rec / n);
   const secs     = groups * avgDelay;
@@ -2304,15 +2480,15 @@ function calcTime() {{
   const rate = (n / avgDelay * 60).toFixed(1);
   el.style.display = '';
   el.innerHTML = '<b>~' + hstr + mstr + '</b> for ' + rec.toLocaleString() + ' recipients' +
-    ' · ' + n + ' sender' + (n>1?'s':'') + ' · avg ' + avgDelay.toFixed(0) + 's gap' +
-    ' · ~' + rate + ' emails/min effective';
+    ' \u00B7 ' + n + ' sender' + (n>1?'s':'') + ' \u00B7 avg ' + avgDelay.toFixed(0) + 's gap' +
+    ' \u00B7 ~' + rate + ' emails/min effective';
 }}
 </script>
 
 <!-- Campaign edit modal -->
 <div class="modal-overlay" id="modal-edit-camp" onclick="if(event.target===this)this.classList.remove('open')">
 <div class="modal">
-  <div class="modal-head"><h3>Edit campaign</h3><button class="icon-btn" onclick="document.getElementById('modal-edit-camp').classList.remove('open')">✕</button></div>
+  <div class="modal-head"><h3>Edit campaign</h3><button class="icon-btn" onclick="document.getElementById('modal-edit-camp').classList.remove('open')">\u2715</button></div>
   <div class="modal-body">
     <input type="hidden" id="edit-camp-id">
     <div class="field"><label>Name</label><input type="text" id="edit-camp-name"></div>
@@ -2325,12 +2501,28 @@ function calcTime() {{
   </div>
 </div></div>
 
+<!-- Schedule modal -->
+<div class="modal-overlay" id="modal-schedule" onclick="if(event.target===this)this.classList.remove('open')">
+<div class="modal" style="max-width:460px">
+  <div class="modal-head"><h3 id="sched-title">Schedule campaign</h3><button class="icon-btn" onclick="document.getElementById('modal-schedule').classList.remove('open')">&#x2715;</button></div>
+  <div class="modal-body">
+    <div class="field"><label for="sched-at">Launch at <span class="hint">(<span class="tz-label">UTC</span>)</span></label><input type="datetime-local" id="sched-at"></div>
+    <p class="dim" style="font-size:12.5px;margin-top:8px">At that time the scheduler launches it as if you had pressed Launch. If its template is edited after the test, the launch is refused and the reason shows on its Analytics page.</p>
+  </div>
+  <div class="modal-foot">
+    <button class="btn ghost" onclick="document.getElementById('modal-schedule').classList.remove('open')">Cancel</button>
+    <button class="btn primary" id="sched-save" onclick="saveSchedule()">Schedule</button>
+  </div>
+</div></div>
+
+
 <!-- Test send checkpoint modal -->
 <div class="modal-overlay" id="modal-test-send" onclick="if(event.target===this)this.classList.remove('open')">
 <div class="modal" style="max-width:520px">
-  <div class="modal-head"><h3 id="ts-title">Test send</h3><button class="icon-btn" onclick="document.getElementById('modal-test-send').classList.remove('open')">✕</button></div>
+  <div class="modal-head"><h3 id="ts-title">Test send</h3><button class="icon-btn" onclick="document.getElementById('modal-test-send').classList.remove('open')">\u2715</button></div>
   <div class="modal-body">
     <div class="field"><label>Send test to</label><input type="email" id="ts-email" placeholder="you@example.com"></div>
+    <p class="dim" style="font-size:12.5px;margin-top:8px">Sends this campaign's own template, filled in for this address the way a launch fills it, with working unsubscribe and delete-my-data links. Only this address gets it.</p>
     <div id="ts-steps" style="margin-top:14px;display:none">
       <div class="stack" style="gap:8px" id="ts-step-list"></div>
     </div>
@@ -2365,7 +2557,7 @@ async function saveCampaign(){{
 
 var _testCampId=null, _testEntityId=null;
 
-/* campaign ⋯ more-menu toggle - div id IS the passed id (e.g. "cm6") */
+/* campaign \u22EF more-menu toggle - div id IS the passed id (e.g. "cm6") */
 function toggleMenu(id){{
   var m=document.getElementById(id);
   if(!m)return;
@@ -2386,7 +2578,7 @@ var _STATUS_PILL    = {{'draft':'','tested':'info','scheduled':'accent','dispatc
 function campAction(id, verb){{
   fetch('/admin/campaigns/'+id+'/'+verb,{{method:'POST',headers:{{'Content-Type':'application/json'}}}})
     .then(function(r){{
-      if(!r.ok){{return r.text().then(function(t){{showToast(t||'Error '+r.status,'err');}});}}
+      if(!r.ok){{return r.text().then(function(t){{var m=t;try{{var e=JSON.parse(t);if(typeof e.detail==='string')m=e.detail;}}catch(x){{}}showToast(m||'Error '+r.status,'err');}});}}
       r.text().then(function(t){{
         var d=null;try{{d=JSON.parse(t);}}catch(e){{}}
         if(d&&d.detail){{showToast(d.detail,'err');return;}}
@@ -2404,6 +2596,7 @@ function campAction(id, verb){{
             }}
           }}
           if(pill&&newStatus){{
+            if(verb==='mark-tested'&&pill.textContent==='scheduled')newStatus='scheduled';
             var cls=_STATUS_PILL[newStatus]||'';
             pill.className='pill'+(cls?' '+cls:'');
             pill.innerHTML='<span class="dot"></span>'+newStatus;
@@ -2418,17 +2611,43 @@ function campAction(id, verb){{
     }}).catch(function(e){{showToast('Error: '+e,'err');}});
 }}
 
+var OLD_BADGE_WARNING={_json.dumps(_OLD_BADGE_WARNING)};
 function launchCampaign(id,btn,relaunch){{
   var label=relaunch?'Re-launch':'Launch';
   var endpoint=relaunch?'/admin/campaigns/'+id+'/relaunch':'/admin/campaigns/'+id+'/launch';
-  if(!confirm(label+' campaign '+id+'?'))return;
-  btn.disabled=true; btn.textContent='Sending…';
-  fetch(endpoint,{{method:'POST',headers:{{'Content-Type':'application/json'}}}})
+  var msg=label+' campaign '+id+'?';
+  if(btn.getAttribute('data-old-badge')==='1')msg=OLD_BADGE_WARNING+'\\n\\n'+msg;
+  if(!confirm(msg))return;
+  btn.disabled=true; btn.textContent='Sending\u2026';
+  fetch(endpoint,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:relaunch?JSON.stringify({{expected_seq:parseInt(btn.getAttribute('data-seq'),10)}}):undefined}})
     .then(function(r){{return r.json();}})
     .then(function(d){{
-      if(d.detail){{showToast(d.detail,'err');btn.disabled=false;btn.textContent=label;}}
-      else{{showToast('Sent - '+d.dispatched+'/'+d.total_recipients+' dispatched','ok');setTimeout(function(){{_reloadKeepScroll();}},1200);}}
-    }}).catch(function(e){{showToast('Error: '+e,'err');btn.disabled=false;btn.textContent=label;}});
+      if(d.detail){{if(relaunch){{alert(d.detail);_reloadKeepScroll();return;}}showToast(d.detail,'err');btn.disabled=false;btn.textContent=label;}}
+      else{{if(d.note)alert(d.note);else showToast('Sent - '+d.dispatched+'/'+d.total_recipients+' dispatched','ok');setTimeout(function(){{_reloadKeepScroll();}},1200);}}
+    }}).catch(function(e){{showToast('Error: '+e,'err');btn.disabled=false;btn.textContent=label;if(relaunch)setTimeout(function(){{_reloadKeepScroll();}},1200);}});
+}}
+
+var _schedId=null, _schedBadge=false;
+function openSchedule(id,btn){{
+  _schedId=id; _schedBadge=btn.getAttribute('data-old-badge')==='1';
+  document.getElementById('sched-title').textContent='Schedule campaign '+id;
+  document.getElementById('sched-at').value='';
+  document.getElementById('modal-schedule').classList.add('open');
+}}
+function saveSchedule(){{
+  var utc=toUtcIso(document.getElementById('sched-at').value);
+  if(!utc){{showToast('Pick a date and time ('+tzName()+').','err');return;}}
+  var msg='Schedule campaign '+_schedId+' for '+fmtLocal(utc)+' ('+tzName()+')?';
+  if(_schedBadge)msg=OLD_BADGE_WARNING+'\\n\\n'+msg;
+  if(!confirm(msg))return;
+  fetch('/admin/campaigns/'+_schedId+'/schedule',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{scheduled_for:utc}})}})
+    .then(function(r){{return r.json();}})
+    .then(function(d){{
+      if(d.detail){{showToast(d.detail,'err');return;}}
+      document.getElementById('modal-schedule').classList.remove('open');
+      showToast('Scheduled for '+fmtLocal(d.scheduled_for)+' ('+tzName()+')','ok');
+      setTimeout(function(){{_reloadKeepScroll();}},800);
+    }}).catch(function(e){{showToast('Error: '+e,'err');}});
 }}
 
 function showToast(msg,type){{
@@ -2459,10 +2678,12 @@ function openTestSend(id,name,entityId){{
   document.getElementById('modal-test-send').classList.add('open');
 }}
 function tsStep(label,state,note){{
-  var icon={{pending:'⏳',ok:'✅',fail:'❌',skip:'⊡'}}[state]||'⏳';
+  var icon={{pending:'\u23F3',ok:'\u2705',fail:'\u274C',skip:'\u22A1'}}[state]||'\u23F3';
   var color={{ok:'var(--ok-fg)',fail:'var(--crit-fg)',pending:'var(--text-muted)',skip:'var(--text-dim)'}}[state]||'var(--text-muted)';
   return '<div class="row" style="gap:10px;padding:6px 0;border-bottom:1px solid var(--border)"><span>'+icon+'</span><div style="flex:1"><b style="font-size:13px">'+label+'</b>'+(note?'<div class="dim" style="font-size:12px">'+note+'</div>':'')+'</div></div>';
 }}
+function _tsEsc(s){{return String(s==null?'':s).replace(/[&<>"']/g,function(c){{return '&#'+c.charCodeAt(0)+';';}});}}
+function _tsMsg(sd){{return _tsEsc(typeof sd.detail==='string'?sd.detail:JSON.stringify(sd));}}
 async function runTestSend(){{
   var email=document.getElementById('ts-email').value.trim();
   if(!email){{alert('Enter a recipient email.');return;}}
@@ -2474,38 +2695,37 @@ async function runTestSend(){{
   list.innerHTML=''; res.innerHTML='';
 
   // Step 1: System checks
-  list.innerHTML+=tsStep('Checking system chain…','pending');
+  list.innerHTML+=tsStep('Checking system chain\u2026','pending');
   var chainRes=await fetch('/admin/campaigns/'+_testCampId+'/test-send-chain');
   var chain=await chainRes.json();
   list.innerHTML='';
   list.innerHTML+=tsStep('Template renders',chain.template_ok?'ok':'fail',chain.template_error||'');
-  list.innerHTML+=tsStep('Encryption key (K_temp)',chain.k_temp_ok?'ok':'fail',chain.k_temp_error||'');
+  list.innerHTML+=tsStep('Encryption key (K_temp)',chain.k_temp_ok?'ok':'skip',chain.k_temp_ok?'':'None yet: the first launch makes one. A test send does not need it.');
   list.innerHTML+=tsStep('Cloud reachable (bearer)',chain.cloud_ok?'ok':'fail',chain.cloud_error||'');
   list.innerHTML+=tsStep('Entity Resend key',chain.entity_ok?'ok':(chain.entity_error?'fail':'skip'),chain.entity_error||'using global key');
 
-  var allOk=chain.template_ok&&chain.k_temp_ok&&chain.cloud_ok;
+  var allOk=chain.template_ok&&chain.cloud_ok;
   if(!allOk){{
     res.innerHTML='<div class="callout crit" style="margin-top:12px">Chain check failed - fix the issues above before sending.</div>';
     btn.disabled=false; return;
   }}
 
-  // Step 2: Quick send
-  list.innerHTML+=tsStep('Sending via Resend…','pending');
-  var sr=await fetch('/admin/quicksend',{{method:'POST',headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{to_email:email,entity_id:null,subject:'[Test] Campaign '+_testCampId,
-      html_body:'<p>This is a test send from MailMan campaign #'+_testCampId+'.</p>'}})}});
+  // Step 2: the campaign's own mail, after the launch's checks
+  list.innerHTML+=tsStep('Sending via Resend\u2026','pending');
+  var sr=await fetch('/admin/campaigns/'+_testCampId+'/test-send',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{to_email:email}})}});
   var sd=await sr.json();
   // Update pending step
-  list.innerHTML=list.innerHTML.replace('Sending via Resend…','Dispatched to Resend');
-  list.innerHTML=list.innerHTML.replace('⏳','');
-  list.innerHTML+=tsStep('Dispatched to Resend',sd.sent?'ok':'fail',sd.sent?'Message ID: '+sd.message_id:JSON.stringify(sd));
+  list.innerHTML=list.innerHTML.replace('Sending via Resend\u2026','Dispatched to Resend');
+  list.innerHTML=list.innerHTML.replace('\u23F3','');
+  list.innerHTML+=tsStep('Dispatched to Resend',sd.sent?'ok':'fail',sd.sent?'Message ID: '+_tsEsc(sd.message_id):_tsMsg(sd));
 
   if(sd.sent){{
-    res.innerHTML='<div class="callout ok" style="margin-top:12px"><div class="ct-body"><b>Test sent to '+email+'</b><br><span class="dim">Message ID: '+sd.message_id+'<br>Mark as tested once confirmed.</span></div></div>';
+    res.innerHTML='<div class="callout ok" style="margin-top:12px"><div class="ct-body"><b>Test sent to '+_tsEsc(email)+'</b><br><span class="dim">Message ID: '+_tsEsc(sd.message_id)+'<br>Mark as tested once confirmed.</span></div></div>';
     // Auto mark-tested offer
-    res.innerHTML+='<form method="post" action="/admin/campaigns/'+_testCampId+'/mark-tested" style="margin-top:10px"><button class="btn sm primary">✓ Mark as tested</button></form>';
+    res.innerHTML+='<button class="btn sm primary" style="margin-top:10px" onclick="campAction('+_testCampId+',\\'mark-tested\\')">&#10003; Mark as tested</button>';
   }} else {{
-    res.innerHTML='<div class="callout crit" style="margin-top:12px">Send failed: '+JSON.stringify(sd)+'</div>';
+    res.innerHTML='<div class="callout crit" style="margin-top:12px">Send failed: '+_tsMsg(sd)+'</div>';
   }}
   btn.disabled=false;
 }}
@@ -2525,10 +2745,10 @@ def campaigns_create(session=Depends(require_session),
                      human_send_min_s: str = Form("60"),
                      human_send_max_s: str = Form("210"),
                      human_send_count: str = Form("1")):
-    from mailman.terminal.routes_admin import create_campaign, CampaignIn
+    from mailman.terminal.routes_admin import create_campaign, CampaignIn, parse_utc_naive, utc_text
     try:
         cid = int(entity_id) if entity_id else None
-        sf = scheduled_for.replace("T", " ") if scheduled_for else None
+        sf = utc_text(parse_utc_naive(scheduled_for)) if scheduled_for.strip() else None
         rl = int(rate_limit_per_min) if rate_limit_per_min.strip() else None
         bp = float(bounce_pause_pct) if bounce_pause_pct.strip() else 0.10
         create_campaign(CampaignIn(name=name, template_id=template_id, kind=kind,
@@ -2556,42 +2776,40 @@ async def campaign_edit(cid: int, request: Request, session=Depends(require_sess
 
 
 @router.post("/admin/campaigns/{cid}/archive")
-def campaign_archive(cid: int, session=Depends(require_session)):
+async def campaign_archive(cid: int, session=Depends(require_session)):
     from mailman.terminal.routes_admin import archive_campaign
-    try:
-        archive_campaign(cid)
-    except Exception:
-        pass
-    return RedirectResponse("/admin/campaigns", status_code=303)
+    return await archive_campaign(cid)
 
 
 @router.get("/admin/campaigns/{cid}/recipients", response_class=HTMLResponse)
 def campaign_recipients_view(cid: int, session=Depends(require_session)):
-    with db.conn() as c:
-        camp = c.execute("SELECT id, name, status FROM campaigns WHERE id=?", (cid,)).fetchone()
+    with db.session() as s:
+        camp = s.execute(select(Campaign.id, Campaign.name, Campaign.status).where(Campaign.id == cid)).mappings().first()
         if not camp:
             return RedirectResponse("/admin/campaigns", status_code=303)
-        count = c.execute(
-            "SELECT count(*) AS n FROM campaign_recipients WHERE campaign_id=?", (cid,)
-        ).fetchone()["n"]
+        count = s.execute(
+            select(func.count().label("n")).select_from(CampaignRecipient).where(CampaignRecipient.campaign_id == cid)
+        ).mappings().first()["n"]
         all_tags = []
-        for row in c.execute("SELECT tags FROM contacts WHERE tags IS NOT NULL").fetchall():
+        for row in s.execute(select(Contact.tags).where(Contact.tags.is_not(None))).mappings().all():
             all_tags.extend((row["tags"] or "").split("|"))
         unique_tags = sorted(set(t.strip() for t in all_tags if t.strip()))
-        stages = [dict(r) for r in c.execute(
-            "SELECT cs.*, t.name AS template_name FROM campaign_stages cs "
-            "JOIN templates t ON t.id=cs.template_id "
-            "WHERE cs.campaign_id=? ORDER BY cs.stage_number",
-            (cid,),
-        ).fetchall()]
+        cs, t = aliased(CampaignStage), aliased(Template)
+        stages = [dict(r) for r in s.execute(
+            select(*cols(cs), t.name.label("template_name"))
+            .join(t, t.id == cs.template_id)
+            .where(cs.campaign_id == cid).order_by(cs.stage_number)
+        ).mappings().all()]
         tmpl_opts_stage = "".join(
             f'<option value="{r["id"]}">{_html.escape(r["name"])}</option>'
-            for r in c.execute("SELECT id, name FROM templates ORDER BY name").fetchall()
+            for r in s.execute(select(Template.id, Template.name).order_by(Template.name)).mappings().all()
         )
+
+    _, stage_errors = _scheduler_errors(cid)
 
     tag_opts = "".join(f"<option>{_html.escape(t)}</option>" for t in unique_tags)
     back_svg = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>'
-    STATUS_PILL = {"draft": "", "tested": "info", "scheduled": "accent", "dispatched": "ok"}
+    STATUS_PILL = {"draft": "", "tested": "info", "scheduled": "accent", "dispatched": "ok", "failed": "crit"}
     sp = STATUS_PILL.get(camp["status"], "")
     body = f"""
 <div class="row" style="gap:8px;margin-bottom:14px">
@@ -2599,7 +2817,7 @@ def campaign_recipients_view(cid: int, session=Depends(require_session)):
 </div>
 <div class="page-head">
   <div class="titles">
-    <div class="eyebrow">Campaign #{cid} · <span class="pill {sp}" style="margin-left:4px"><span class="dot"></span>{camp["status"]}</span></div>
+    <div class="eyebrow">Campaign #{cid} \u00B7 <span class="pill {sp}" style="margin-left:4px"><span class="dot"></span>{camp["status"]}</span></div>
     <h1 class="page-title">{_html.escape(camp["name"])}</h1>
     <p class="page-sub">{count} recipient(s) added so far</p>
   </div>
@@ -2638,10 +2856,10 @@ def campaign_recipients_view(cid: int, session=Depends(require_session)):
 
 <hr class="divider">
 <div class="section-title" style="margin-bottom:12px">Email sequence (stages)
-  <span class="count">· {len(stages)}</span>
+  <span class="count">\u00B7 {len(stages)}</span>
   <span class="hint" style="font-weight:400;margin-left:6px">Each stage sends a different template to the same recipients at its scheduled time. The scheduler fires them automatically.</span>
 </div>
-{_stages_html(cid, stages, tmpl_opts_stage)}
+{_stages_html(cid, stages, tmpl_opts_stage, stage_errors)}
 """
     return _layout(f"Recipients - {_html.escape(camp['name'])}", body, "/admin/campaigns", session)
 
@@ -2650,9 +2868,9 @@ def campaign_recipients_view(cid: int, session=Depends(require_session)):
 def campaign_add_stage(cid: int, session=Depends(require_session),
                         template_id: int = Form(...), scheduled_for: str = Form(...),
                         note: str = Form("")):
-    from mailman.terminal.routes_admin import add_stage, StageIn
+    from mailman.terminal.routes_admin import add_stage, StageIn, parse_utc_naive, utc_text
     try:
-        sf = scheduled_for.replace("T", " ") if scheduled_for else scheduled_for
+        sf = utc_text(parse_utc_naive(scheduled_for))
         add_stage(cid, StageIn(template_id=template_id, scheduled_for=sf, note=note or None))
     except Exception:
         pass
@@ -2683,11 +2901,7 @@ def campaign_add_by_tag(cid: int, session=Depends(require_session), tag: str = F
 @router.post("/admin/campaigns/{cid}/mark-tested")
 def campaigns_mark_tested(cid: int, session=Depends(require_session)):
     from mailman.terminal.routes_admin import mark_tested
-    try:
-        mark_tested(cid)
-    except Exception:
-        pass
-    return RedirectResponse("/admin/campaigns", status_code=303)
+    return mark_tested(cid)
 
 
 def _human_send_estimate(camp: dict, queued: int) -> str:
@@ -2705,8 +2919,8 @@ def _human_send_estimate(camp: dict, queued: int) -> str:
     rate    = n / avg * 60
     return (f'<div class="callout" style="margin-bottom:16px">'
             f'<div class="ct-body"><b>~{hstr}{m}m remaining</b> for {queued:,} queued recipients'
-            f' · {n} sender{"s" if n>1 else ""} · {mn}–{mx}s gap'
-            f' · ~{rate:.1f} emails/min effective</div></div>')
+            f' \u00B7 {n} sender{"s" if n>1 else ""} \u00B7 {mn}\u2013{mx}s gap'
+            f' \u00B7 ~{rate:.1f} emails/min effective</div></div>')
 
 
 @router.get("/admin/campaigns/{cid}/analytics", response_class=HTMLResponse)
@@ -2720,6 +2934,13 @@ def campaign_analytics_view(cid: int, session=Depends(require_session)):
     camp = data["campaign"]
     s = data["summary"]
     rows = data["recipients"]
+    from mailman.terminal.sync_client import UNKNOWN_PREFIX
+    _UNKNOWN_NOTE = ("{n} recipient(s) have an unknown delivery outcome: the mail provider failed while sending, "
+                     "so the mail may or may not have gone out. MailMan does not resend them, and Retry failed "
+                     "skips them. Check them in your Resend dashboard.")
+
+    def _is_unknown(r: dict) -> bool:
+        return r["status"] == "sent" and (r.get("failure_reason") or "").startswith(UNKNOWN_PREFIX)
 
     def _stat(label: str, n: int, pct: str = "", color: str = "") -> str:
         style = f"color:{color}" if color else ""
@@ -2761,11 +2982,10 @@ def campaign_analytics_view(cid: int, session=Depends(require_session)):
     has_failed = s["failed"] > 0 and camp["status"] in ("dispatched", "tested")
     retry_svg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/></svg>'
     back_svg = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>'
-    STATUS_PILL = {"draft": "", "tested": "info", "scheduled": "accent", "dispatched": "ok"}
+    STATUS_PILL = {"draft": "", "tested": "info", "scheduled": "accent", "dispatched": "ok", "failed": "crit"}
     sp = STATUS_PILL.get(camp["status"], "")
     retry_btn_html = (
-        f'<form method="post" action="/admin/campaigns/{cid}/retry" style="display:inline">'
-        f'<button class="btn danger">{retry_svg} Retry {s["failed"]} failed</button></form>'
+        f'<button class="btn danger" onclick="retryFailed({cid})">{retry_svg} Retry {s["failed"]} failed</button>'
     ) if has_failed else ""
 
     # Engagement funnel bar - opens are NOT tracked (bot noise); clicks are the signal
@@ -2784,23 +3004,28 @@ def campaign_analytics_view(cid: int, session=Depends(require_session)):
 
     STATUS_R_PILL = {"sent": "", "opened": "ok", "clicked": "accent", "bounced": "warn", "complained": "crit", "failed": "crit", "queued": ""}
     def _r_row(r) -> str:
-        rsp = STATUS_R_PILL.get(r["status"], "")
+        unknown = _is_unknown(r)
+        rsp = "warn" if unknown else STATUS_R_PILL.get(r["status"], "")
+        last = _html.escape(r["failure_reason"]) if unknown else (r["message_id"] or "")[:20]
         return (f'<tr><td class="cell-strong">{_html.escape(r.get("email") or "-")}</td>'
-                f'<td><span class="pill {rsp}"><span class="dot"></span>{r["status"]}</span></td>'
+                f'<td><span class="pill {rsp}"><span class="dot"></span>{"unknown" if unknown else r["status"]}</span></td>'
                 f'<td class="cell-dim">{(r["sent_at"] or "")[:16]}</td>'
                 f'<td class="cell-dim">{(r["clicked_at"] or "")[:16] or "-"}</td>'
-                f'<td class="cell-mono">{(r["message_id"] or "")[:20]}</td></tr>')
+                f'<td class="cell-mono">{last}</td></tr>')
     recip_rows = "".join(_r_row(r) for r in rows) or '<tr><td colspan=5 class="empty" style="padding:32px">No recipients yet.</td></tr>'
+    n_unknown = sum(1 for r in rows if _is_unknown(r))
+    unknown_note = (f'<div class="callout warn" style="margin-bottom:16px"><div class="ct-body">'
+                    f'{_html.escape(_UNKNOWN_NOTE.format(n=n_unknown))}</div></div>') if n_unknown else ""
 
     # v3.22 batches card
     from mailman.terminal import db as _db
     _now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    with _db.conn() as _c:
-        batch_rows = [dict(b) for b in _c.execute(
-            "SELECT * FROM campaign_batches WHERE campaign_id=? ORDER BY batch_no", (cid,)
-        ).fetchall()]
-        seed_list = [s["email"] for s in _c.execute(
-            "SELECT email FROM seed_addresses WHERE active=1 ORDER BY id").fetchall()]
+    with _db.session() as _s:
+        batch_rows = [dict(b) for b in _s.execute(
+            select(*cols(CampaignBatch)).where(CampaignBatch.campaign_id == cid).order_by(CampaignBatch.batch_no)
+        ).mappings().all()]
+        seed_list = [s["email"] for s in _s.execute(
+            select(SeedAddress.email).where(SeedAddress.active == 1).order_by(SeedAddress.id)).mappings().all()]
     batch_card = ""
     if batch_rows:
         B_PILL = {"pending":"", "scheduled":"info", "sending":"accent", "drained":"info",
@@ -2808,8 +3033,8 @@ def campaign_analytics_view(cid: int, session=Depends(require_session)):
         def _b_row(b):
             sp2 = B_PILL.get(b["status"], "")
             win = f'{(b["window_start"] or "")[:16]} -> {(b["window_end"] or "")[11:16]}' if b["window_start"] else "-"
-            counts = (f'{b["sent"]} sent · {b["clicked"]} cl · '
-                      f'{b["bounced"]} bn · {b["unsub"]} un')
+            counts = (f'{b["sent"]} sent \u00B7 {b["clicked"]} cl \u00B7 '
+                      f'{b["bounced"]} bn \u00B7 {b["unsub"]} un')
             action = ""
             if b["status"] == "pending":
                 prev = next((x for x in batch_rows if x["batch_no"] == b["batch_no"] - 1), None)
@@ -2840,13 +3065,13 @@ def campaign_analytics_view(cid: int, session=Depends(require_session)):
   <div class="row" style="gap:8px;margin-top:12px;align-items:center;flex-wrap:wrap">
     <span class="dim" style="font-size:12px">Log seed placement (batch #{active_batch['batch_no']}):</span>
     <select id="seedSel" class="input sm" style="max-width:240px">{seed_opts}</select>
-    <button class="btn ghost sm" onclick="logPlace({active_batch['id']},'inbox')">📥 Inbox</button>
-    <button class="btn ghost sm" onclick="logPlace({active_batch['id']},'spam')">🚫 Spam</button>
-    <button class="btn ghost sm" onclick="logPlace({active_batch['id']},'promotions')">🏷️ Promotions</button>
+    <button class="btn ghost sm" onclick="logPlace({active_batch['id']},'inbox')">\U0001F4E5 Inbox</button>
+    <button class="btn ghost sm" onclick="logPlace({active_batch['id']},'spam')">\U0001F6AB Spam</button>
+    <button class="btn ghost sm" onclick="logPlace({active_batch['id']},'promotions')">\U0001F3F7\uFE0F Promotions</button>
   </div>"""
         batch_card = f"""
 <div class="card pad mb">
-  <div class="section-title between" style="display:flex">Batches <span class="dim" style="font-weight:400">1000/batch · manual approve-next · {len(seed_list)} seed(s) salted</span></div>
+  <div class="section-title between" style="display:flex">Batches <span class="dim" style="font-weight:400">1000/batch \u00B7 manual approve-next \u00B7 {len(seed_list)} seed(s) salted</span></div>
   <div class="table-wrap" style="margin-top:8px">
     <table class="tbl">
       <thead><tr><th>Batch</th><th>Size</th><th>Status</th><th>Window (UTC)</th><th>Outcomes</th><th></th></tr></thead>
@@ -2855,18 +3080,30 @@ def campaign_analytics_view(cid: int, session=Depends(require_session)):
   </div>{place_card}
 </div>"""
 
+    camp_err = _scheduler_errors(cid)[0] if camp["status"] == "failed" else None
+    refusal_html = (f'<div class="callout crit" style="margin-bottom:16px"><div class="ct-body">'
+                    f'<b>The scheduler did not launch this campaign.</b> {_html.escape(camp_err.rstrip("."))}.'
+                    f'<div class="dim" style="margin-top:4px">Fix the cause, send a test and mark the campaign '
+                    f'tested, then launch or schedule it from the Campaigns page.</div></div></div>') if camp_err else ""
+    retry_err = _scheduler_retry(cid, camp["updated_at"]) if camp["status"] == "scheduled" else None
+    retry_html = (f'<div class="callout warn" style="margin-bottom:16px"><div class="ct-body">'
+                  f'The scheduler has not launched this campaign yet: {_html.escape(retry_err.rstrip("."))}. '
+                  f'It tries again every minute.</div></div>') if retry_err else ""
+
     body = f"""
 <div class="row" style="gap:8px;margin-bottom:14px">
   <a class="link muted" href="/admin/campaigns" style="display:inline-flex;align-items:center;gap:5px;font-size:12.5px">{back_svg} Campaigns</a>
 </div>
 <div class="page-head">
   <div class="titles">
-    <div class="eyebrow">Campaign #{cid} · <span class="pill {sp}" style="margin-left:4px"><span class="dot"></span>{camp["status"]}</span></div>
+    <div class="eyebrow">Campaign #{cid} \u00B7 <span class="pill {sp}" style="margin-left:4px"><span class="dot"></span>{camp["status"]}</span></div>
     <h1 class="page-title">{_html.escape(camp["name"])}</h1>
     <p class="page-sub">{_html.escape(camp["kind"])}</p>
   </div>
   <div class="head-actions">{retry_btn_html}</div>
 </div>
+{refusal_html}
+{retry_html}
 
 <div class="stat-strip mb">
   <div class="stat"><div class="k">Sent</div><div class="v">{s["sent"]:,}</div></div>
@@ -2874,8 +3111,8 @@ def campaign_analytics_view(cid: int, session=Depends(require_session)):
   <div class="stat"><div class="k"><span class="led" style="background:var(--warn-fg)"></span>Bounced</div><div class="v warn">{s["bounced"]}</div><div class="sub">{s["bounced_pct"]}</div></div>
   <div class="stat"><div class="k"><span class="led" style="background:var(--crit-fg)"></span>Complained</div><div class="v crit">{s["complained"]}</div><div class="sub">{s["complained_pct"]}</div></div>
   <div class="stat"><div class="k"><span class="led" style="background:var(--crit-fg)"></span>Failed</div><div class="v{"" if not s["failed"] else " crit"}">{s["failed"]}</div></div>
-  <div class="stat"><div class="k">Rate limit</div><div class="v" style="font-size:1em">{"human ×" + str(camp.get("human_send_count") or 1) if camp.get("human_send") else (str(camp.get("rate_limit_per_min") or "-") + ("/min" if camp.get("rate_limit_per_min") else ""))}</div></div>
-  <div class="stat"><div class="k">{"Send delay" if camp.get("human_send") else "Bounce threshold"}</div><div class="v" style="font-size:1em">{f'{camp.get("human_send_min_s",60)}–{camp.get("human_send_max_s",210)}s' if camp.get("human_send") else f'{int((camp.get("bounce_pause_pct") or 0.10) * 100)}%'}</div></div>
+  <div class="stat"><div class="k">Rate limit</div><div class="v" style="font-size:1em">{"human \u00D7" + str(camp.get("human_send_count") or 1) if camp.get("human_send") else (str(camp.get("rate_limit_per_min") or "-") + ("/min" if camp.get("rate_limit_per_min") else ""))}</div></div>
+  <div class="stat"><div class="k">{"Send delay" if camp.get("human_send") else "Bounce threshold"}</div><div class="v" style="font-size:1em">{f'{camp.get("human_send_min_s",60)}\u2013{camp.get("human_send_max_s",210)}s' if camp.get("human_send") else f'{int((camp.get("bounce_pause_pct") or 0.10) * 100)}%'}</div></div>
 </div>
 {_human_send_estimate(camp, s["queued"] if "queued" in s else 0)}
 
@@ -2883,9 +3120,9 @@ def campaign_analytics_view(cid: int, session=Depends(require_session)):
   <div class="section-title between" style="display:flex">Engagement funnel <span class="dim" style="font-weight:400">relative to sent</span></div>
   <div class="stack" style="gap:10px;margin-top:8px">{bar_html}</div>
 </div>
-{batch_card}
+{batch_card}{unknown_note}
 <div class="row between mb" style="flex-wrap:wrap;gap:12px">
-  <div class="section-title" style="margin:0">Per-recipient <span class="count">· {len(rows)}</span></div>
+  <div class="section-title" style="margin:0">Per-recipient <span class="count">\u00B7 {len(rows)}</span></div>
   <span id="live-status" class="dim" style="font-size:12px"></span>
 </div>
 <div class="table-wrap">
@@ -2904,11 +3141,11 @@ def campaign_analytics_view(cid: int, session=Depends(require_session)):
       .then(function(r){{return r.json();}})
       .then(function(d){{
         var s=d.summary||{{}};
-        document.getElementById('live-status').textContent='Live · sent '+s.sent+' / queued '+s.queued;
-        if(s.queued===0){{clearInterval(interval);document.getElementById('live-status').textContent='✓ Dispatch complete';setTimeout(function(){{_reloadKeepScroll();}},1500);}}
+        document.getElementById('live-status').textContent='Live \u00B7 sent '+s.sent+' / queued '+s.queued;
+        if(s.queued===0){{clearInterval(interval);document.getElementById('live-status').textContent='\u2713 Dispatch complete';setTimeout(function(){{_reloadKeepScroll();}},1500);}}
       }}).catch(function(){{}});
   }},5000);
-  document.getElementById('live-status').textContent='Dispatching… polling every 5s';
+  document.getElementById('live-status').textContent='Dispatching\u2026 polling every 5s';
 }})();
 function approveBatch(cid, n){{
   if(!confirm('Release batch #'+n+' now? It schedules into the next send window.'))return;
@@ -2922,8 +3159,16 @@ function logPlace(batchId, placement){{
   fetch('/admin/batches/'+batchId+'/placement',{{method:'POST',
     headers:{{'Content-Type':'application/json'}},
     body:JSON.stringify({{seed_email:sel.value, placement:placement}})}})
-    .then(function(r){{ if(r.ok){{var ls=document.getElementById('live-status'); if(ls)ls.textContent='✓ logged '+sel.value+' -> '+placement;}} }})
+    .then(function(r){{ if(r.ok){{var ls=document.getElementById('live-status'); if(ls)ls.textContent='\u2713 logged '+sel.value+' -> '+placement;}} }})
     .catch(function(e){{alert('log failed: '+e);}});
+}}
+function retryFailed(cid){{
+  fetch('/admin/campaigns/'+cid+'/retry',{{method:'POST'}})
+    .then(function(r){{
+      if(r.ok){{location.reload();return;}}
+      return r.text().then(function(t){{var m=t;try{{var e=JSON.parse(t);if(typeof e.detail==='string')m=e.detail;}}catch(x){{}}alert(m||'Error '+r.status);}});
+    }})
+    .catch(function(e){{alert('Error: '+e);}});
 }}
 </script>
 """
@@ -2933,41 +3178,25 @@ function logPlace(batchId, placement){{
 @router.post("/admin/campaigns/{cid}/retry")
 def campaign_retry(cid: int, session=Depends(require_session)):
     from mailman.terminal.routes_admin import retry_failed
-    try:
-        retry_failed(cid)
-    except Exception:
-        pass
-    return RedirectResponse(f"/admin/campaigns/{cid}/analytics", status_code=303)
+    return retry_failed(cid)
 
 
 @router.post("/admin/campaigns/{cid}/pause")
 def campaign_pause(cid: int, session=Depends(require_session)):
     from mailman.terminal.routes_admin import pause_campaign
-    try:
-        pause_campaign(cid)
-    except Exception:
-        pass
-    return RedirectResponse("/admin/campaigns", status_code=303)
+    return pause_campaign(cid)
 
 
 @router.post("/admin/campaigns/{cid}/resume")
 def campaign_resume(cid: int, session=Depends(require_session)):
     from mailman.terminal.routes_admin import resume_campaign
-    try:
-        resume_campaign(cid)
-    except Exception:
-        pass
-    return RedirectResponse("/admin/campaigns", status_code=303)
+    return resume_campaign(cid)
 
 
 @router.post("/admin/campaigns/{cid}/clone")
 def campaign_clone(cid: int, session=Depends(require_session)):
     from mailman.terminal.routes_admin import clone_campaign
-    try:
-        result = clone_campaign(cid)
-        return RedirectResponse(f"/admin/campaigns/{result['id']}/recipients", status_code=303)
-    except Exception:
-        return RedirectResponse("/admin/campaigns", status_code=303)
+    return clone_campaign(cid)
 
 
 @router.get("/admin/settings/sending", response_class=HTMLResponse)
@@ -2979,7 +3208,7 @@ def sending_settings_view(session=Depends(require_session), ok: str = ""):
         return v if v not in (None, "") else str(d)
     FIELDS = [
         ("send_window_tz", "Window timezone", "IANA tz, e.g. America/Los_Angeles", "America/Los_Angeles"),
-        ("send_window_start_hour", "Window start hour (local)", "0–23; 9 = 09:00", "9"),
+        ("send_window_start_hour", "Window start hour (local)", "0\u201323; 9 = 09:00", "9"),
         ("send_window_hours", "Window length (hours)", "e.g. 4 -> a 4-hour window", "4"),
         ("send_sender_count", "Parallel senders", "how many send cursors run in parallel", "3"),
         ("send_jitter_min_s", "Jitter min (sec)", "min gap between a sender's sends", "60"),
@@ -2999,7 +3228,7 @@ def sending_settings_view(session=Depends(require_session), ok: str = ""):
     saved = f'<div class="banner ok" style="margin-bottom:12px">Saved <code>{_html.escape(ok)}</code>.</div>' if ok else ""
     body = f"""
 <div class="page-head"><div class="titles">
-  <div class="eyebrow">Operations · Sending</div>
+  <div class="eyebrow">Operations \u00B7 Sending</div>
   <h1 class="page-title">Send window &amp; pacing</h1>
   <p class="page-sub">How batched campaigns spread over time. The terminal compiles a <code>send_at</code> per recipient from these; the cloud fires each when due. Changes apply to the next batch loaded - no redeploy.</p>
 </div></div>
@@ -3014,13 +3243,14 @@ def sending_settings_view(session=Depends(require_session), ok: str = ""):
 def seeds_view(session=Depends(require_session)):
     """Seed/monitor addresses salted into every batch for inbox-placement checks."""
     from mailman.terminal import db as _db
-    with _db.conn() as c:
-        seeds = [dict(r) for r in c.execute(
-            "SELECT * FROM seed_addresses ORDER BY id").fetchall()]
-        recent = [dict(r) for r in c.execute(
-            "SELECT sp.*, cb.campaign_id, cb.batch_no FROM seed_placements sp "
-            "LEFT JOIN campaign_batches cb ON cb.id = sp.batch_id "
-            "ORDER BY sp.id DESC LIMIT 25").fetchall()]
+    with _db.session() as s:
+        seeds = [dict(r) for r in s.execute(
+            select(*cols(SeedAddress)).order_by(SeedAddress.id)).mappings().all()]
+        sp, cb = aliased(SeedPlacement), aliased(CampaignBatch)
+        recent = [dict(r) for r in s.execute(
+            select(*cols(sp), cb.campaign_id, cb.batch_no)
+            .outerjoin(cb, cb.id == sp.batch_id)
+            .order_by(sp.id.desc()).limit(25)).mappings().all()]
 
     def _seed_row(s):
         on = s["active"] == 1
@@ -3040,7 +3270,7 @@ def seeds_view(session=Depends(require_session)):
         return (f'<tr><td class="cell-dim">{(p["checked_at"] or "")[:16]}</td>'
                 f'<td class="cell-strong">{_html.escape(p["seed_email"])}</td>'
                 f'<td><span class="pill {P_PILL.get(p["placement"],"")}"><span class="dot"></span>{p["placement"]}</span></td>'
-                f'<td class="cell-dim">{("camp "+str(p["campaign_id"])+" · batch "+str(p["batch_no"])) if p.get("campaign_id") else "-"}</td></tr>')
+                f'<td class="cell-dim">{("camp "+str(p["campaign_id"])+" \u00B7 batch "+str(p["batch_no"])) if p.get("campaign_id") else "-"}</td></tr>')
     place_rows = "".join(_place_row(p) for p in recent) or \
         '<tr><td colspan=4 class="empty" style="padding:24px">No placement logged yet.</td></tr>'
 
@@ -3056,12 +3286,12 @@ def seeds_view(session=Depends(require_session)):
 <div class="card pad mb">
   <div class="row" style="gap:8px;flex-wrap:wrap;align-items:center">
     <input id="seedEmail" class="input" placeholder="seed@gmail.com" style="max-width:280px">
-    <input id="seedProvider" class="input" placeholder="provider (gmail, outlook…)" style="max-width:200px">
+    <input id="seedProvider" class="input" placeholder="provider (gmail, outlook\u2026)" style="max-width:200px">
     <button class="btn" onclick="addSeed()">Add seed</button>
   </div>
 </div>
 
-<div class="section-title">Seeds <span class="count">· {len(seeds)}</span></div>
+<div class="section-title">Seeds <span class="count">\u00B7 {len(seeds)}</span></div>
 <div class="table-wrap mb">
   <table class="tbl">
     <thead><tr><th>Email</th><th>Provider</th><th>Status</th><th></th></tr></thead>
@@ -3128,10 +3358,11 @@ async def entities_bulk_import(session=Depends(require_session), file: UploadFil
 
 @router.get("/admin/drift", response_class=HTMLResponse)
 def drift_view(session=Depends(require_session)):
-    with db.conn() as c:
-        rows = c.execute(
-            "SELECT * FROM drift_report ORDER BY severity='CRITICAL' DESC, detected_at DESC LIMIT 200"
-        ).fetchall()
+    with db.session() as s:
+        rows = s.execute(
+            select(*cols(DriftReport))
+            .order_by((DriftReport.severity == "CRITICAL").desc(), DriftReport.detected_at.desc()).limit(200)
+        ).mappings().all()
     drift_crit_ct = sum(1 for r in rows if r["severity"] == "CRITICAL" and not r["acknowledged_at"])
     drift_warn_ct = sum(1 for r in rows if r["severity"] == "WARN" and not r["acknowledged_at"])
     check_svg = '<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>'
@@ -3237,15 +3468,15 @@ def _entities_config() -> str:
         except Exception as e:
             cloud_html = f"<p style='color:#888;font-size:.88em;margin-top:.5em'>Cloud unreachable: {_html.escape(str(e))}</p>"
     else:
-        cloud_html = "<p style='color:#888;font-size:.88em;margin-top:.5em'>Run <code>bin/v3 init-handshake</code> to unlock cloud settings.</p>"
+        cloud_html = "<p style='color:#888;font-size:.88em;margin-top:.5em'>Cloud settings require a handshake. Helper: <code>scripts/v3 init-handshake</code> (see Known limitations in the README).</p>"
 
     return _config_section("Brand &amp; sender config", brand_rows) + cloud_html
 
 
 @router.get("/admin/entities", response_class=HTMLResponse)
 def entities_view(session=Depends(require_session)):
-    with db.conn() as c:
-        rows = c.execute("SELECT * FROM entities ORDER BY name").fetchall()
+    with db.session() as s:
+        rows = s.execute(select(*cols(Entity)).order_by(Entity.name)).mappings().all()
 
     close_x = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>'
     lock_svg = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>'
@@ -3261,7 +3492,7 @@ def entities_view(session=Depends(require_session)):
       <input type="checkbox" value="{r['id']}" onchange="entityToggle({r['id']},this)" style="margin-top:3px;width:14px;height:14px;accent-color:var(--accent)" title="Select for export">
       <div>
         <h3 style="font-size:14px;margin-bottom:3px">{_html.escape(r['name'])}</h3>
-        <div class="cell-dim" style="font-size:12.5px">🌐 {_html.escape(r['domain'])}</div>
+        <div class="cell-dim" style="font-size:12.5px">\U0001F310 {_html.escape(r['domain'])}</div>
       </div>
     </div>
     {badge}
@@ -3327,7 +3558,7 @@ async function entityImport(){{
   var f=document.getElementById('entity-import-file').files[0];
   if(!f)return;
   var st=document.getElementById('entity-import-status');
-  st.textContent='Importing…';
+  st.textContent='Importing\u2026';
   var fd=new FormData(); fd.append('file',f);
   var r=await fetch('/admin/entities/bulk-import',{{method:'POST',body:fd}});
   var d=await r.json();
@@ -3343,7 +3574,7 @@ async function entityImport(){{
 
 {_help_overlay("entity-export-help", "Entity export format",
     '<p class="dim" style="margin-bottom:12px">Exports a <b>JSON array</b>. <b>Resend API keys are excluded</b> for security - they must be set manually after import.</p>'
-    '<pre>[\n  {{\n    "name": "Acme Studio",\n    "domain": "mail.acme.io",\n    "from_name": "Acme",\n    "from_email": "hello@mail.acme.io",\n    "footer_address": "42 Main St",\n    "support_email": "support@acme.io",\n    "public_host": "mail.acme.io"\n  }}\n]</pre>'
+    '<pre>[\n  {{\n    "name": "Acme Studio",\n    "domain": "mail.example.com",\n    "from_name": "Acme",\n    "from_email": "hello@mail.example.com",\n    "footer_address": "42 Main St",\n    "support_email": "support@example.com",\n    "public_host": "mail.example.com"\n  }}\n]</pre>'
     '<p class="dim" style="font-size:12px">Export all or select cards using the checkbox that appears on hover.</p>'
 )}
 {_help_overlay("entity-import-help", "Entity import format",
@@ -3367,10 +3598,10 @@ async function entityImport(){{
   <div class="modal-body">
     <form method="post" action="/admin/entities/create" id="add-form">
       <div class="field"><label>Entity name</label><input type="text" name="name" required autofocus placeholder="Acme Studio"></div>
-      <div class="field"><label>Sending domain</label><input type="text" name="domain" required class="mono" placeholder="mail.acme.io"></div>
+      <div class="field"><label>Sending domain</label><input type="text" name="domain" required class="mono" placeholder="mail.example.com"></div>
       <div class="form-grid">
         <div class="field"><label>From name</label><input type="text" name="from_name" placeholder="Acme"></div>
-        <div class="field"><label>From email</label><input type="email" name="from_email" placeholder="hello@mail.acme.io"></div>
+        <div class="field"><label>From email</label><input type="email" name="from_email" placeholder="hello@mail.example.com"></div>
       </div>
     </form>
   </div>
@@ -3411,8 +3642,8 @@ async function entityImport(){{
       {lock_svg}
       <div class="ct-body">The key is encrypted at rest and <b>never shown again</b> after save.</div>
     </div>
-    <form method="post" id="key-form" action="">
-      <div class="field"><label>Resend API key</label><input type="password" name="resend_api_key" id="key-input" required autocomplete="off" class="mono" placeholder="re_••••••••••••••••"></div>
+    <form method="post" id="key-form" action="" onsubmit="return saveKey(event)">
+      <div class="field"><label>Resend API key</label><input type="password" name="resend_api_key" id="key-input" required autocomplete="off" class="mono" placeholder="re_\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"></div>
     </form>
   </div>
   <div class="modal-foot" style="flex-direction:column;align-items:stretch;gap:10px">
@@ -3422,7 +3653,7 @@ async function entityImport(){{
     </div>
     <div class="row" style="justify-content:flex-end;gap:8px">
       <button class="btn ghost" onclick="closeModals()">Cancel</button>
-      <button class="btn primary" onclick="document.getElementById('key-form').submit()">Save key</button>
+      <button class="btn primary" onclick="saveKey(event)">Save key</button>
     </div>
   </div>
 </div>
@@ -3436,13 +3667,24 @@ function openKey(id,name){{closeModals();document.getElementById('key-modal-titl
 async function testConnection(){{
   var id=document.getElementById('test-btn').dataset.id;
   var r=document.getElementById('test-result');
-  r.textContent='Testing…'; r.style.color='var(--text-muted)';
+  r.textContent='Testing\u2026'; r.style.color='var(--text-muted)';
   try{{
     var res=await fetch('/admin/entities/'+id+'/test-connection',{{method:'POST'}});
     var d=await res.json();
     r.textContent=d.detail;
     r.style.color=d.ok?'var(--ok-fg)':'var(--crit-fg)';
   }}catch(e){{r.textContent='Error: '+e;r.style.color='var(--crit-fg)';}}
+}}
+async function saveKey(ev){{
+  ev.preventDefault();
+  if(!document.getElementById('key-form').reportValidity())return false;
+  var id=document.getElementById('test-btn').dataset.id;
+  var r=await fetch('/admin/entities/'+id+'/set-key',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{resend_api_key:document.getElementById('key-input').value}})}});
+  if(r.ok){{location.reload();return false;}}
+  var t=await r.text();var m=t;try{{var e=JSON.parse(t);if(typeof e.detail==='string')m=e.detail;}}catch(x){{}}
+  var res=document.getElementById('test-result');
+  res.textContent=m||'Error '+r.status;res.style.color='var(--crit-fg)';
+  return false;
 }}
 </script>
 {_entities_config()}
@@ -3482,14 +3724,18 @@ def entities_update(cid: int, session=Depends(require_session),
 
 
 @router.post("/admin/entities/{cid}/set-key")
-def entities_set_key(cid: int, session=Depends(require_session),
-                      resend_api_key: str = Form(...)):
-    from mailman.terminal.routes_admin import set_entity_key, EntityKeyIn
+async def entities_set_key(cid: int, request: Request, session=Depends(require_session)):
+    from mailman.terminal.routes_admin import set_entity_key
     try:
-        set_entity_key(cid, EntityKeyIn(resend_api_key=resend_api_key))
+        data = await request.json()
     except Exception:
-        pass
-    return RedirectResponse("/admin/entities", status_code=303)
+        data = None
+    value = data.get("resend_api_key") if isinstance(data, dict) else None
+    if not isinstance(value, str):
+        raise HTTPException(status_code=422, detail="request body must be JSON with resend_api_key")
+    if not value.strip():
+        raise HTTPException(status_code=422, detail="key must not be empty")
+    return set_entity_key(cid, EntityKeyIn(resend_api_key=value))
 
 
 @router.post("/admin/entities/{cid}/delete")
@@ -3507,17 +3753,18 @@ def entities_delete(cid: int, session=Depends(require_session)):
 @router.get("/admin/suppression", response_class=HTMLResponse)
 def suppression_view(session=Depends(require_session), reason: str = ""):
     import hashlib as _hl
-    with db.conn() as c:
+    with db.session() as s:
         if reason:
-            sup_rows = c.execute(
-                "SELECT email_hash, reason, source, added_at FROM suppression_hashes WHERE reason=? ORDER BY added_at DESC LIMIT 500",
-                (reason,),
-            ).fetchall()
+            sup_rows = s.execute(
+                select(SuppressionHash.email_hash, SuppressionHash.reason, SuppressionHash.source, SuppressionHash.added_at)
+                .where(SuppressionHash.reason == reason).order_by(SuppressionHash.added_at.desc()).limit(500)
+            ).mappings().all()
         else:
-            sup_rows = c.execute(
-                "SELECT email_hash, reason, source, added_at FROM suppression_hashes ORDER BY added_at DESC LIMIT 500"
-            ).fetchall()
-        contacts = c.execute("SELECT email FROM contacts").fetchall()
+            sup_rows = s.execute(
+                select(SuppressionHash.email_hash, SuppressionHash.reason, SuppressionHash.source, SuppressionHash.added_at)
+                .order_by(SuppressionHash.added_at.desc()).limit(500)
+            ).mappings().all()
+        contacts = s.execute(select(Contact.email)).mappings().all()
 
     # Build hash->email lookup
     h2email: dict[str, str] = {}
@@ -3536,7 +3783,7 @@ def suppression_view(session=Depends(require_session), reason: str = ""):
         rp = REASON_PILL.get(r["reason"], "")
         em = h2email.get(r["email_hash"], "")
         return (f'<tr>'
-                f'<td>{_html.escape(em) if em else ("<span class=\"cell-mono\">" + r["email_hash"][:16] + "…</span>")}</td>'
+                f'<td>{_html.escape(em) if em else ("<span class=\"cell-mono\">" + r["email_hash"][:16] + "\u2026</span>")}</td>'
                 f'<td><span class="pill {rp}"><span class="dot"></span>{r["reason"]}</span></td>'
                 f'<td class="cell-dim">{r["source"]}</td>'
                 f'<td class="cell-dim">{(r["added_at"] or "")[:16]}</td>'
@@ -3544,12 +3791,16 @@ def suppression_view(session=Depends(require_session), reason: str = ""):
     table = "".join(_sup_row(r) for r in sup_rows) or \
         '<tr><td colspan=4 class="empty" style="padding:32px">No suppression entries.</td></tr>'
 
-    with db.conn() as c2:
-        total_sup = c2.execute("SELECT count(*) FROM suppression_hashes").fetchone()[0]
-        unsub_ct = c2.execute("SELECT count(*) FROM suppression_hashes WHERE reason='unsubscribe'").fetchone()[0]
-        bounce_ct = c2.execute("SELECT count(*) FROM suppression_hashes WHERE reason='bounce_hard'").fetchone()[0]
-        complaint_ct = c2.execute("SELECT count(*) FROM suppression_hashes WHERE reason='complaint'").fetchone()[0]
-        erasure_ct = c2.execute("SELECT count(*) FROM suppression_hashes WHERE reason='erasure_request'").fetchone()[0]
+    with db.session() as s2:
+        total_sup = s2.execute(select(func.count()).select_from(SuppressionHash)).scalar_one()
+        unsub_ct = s2.execute(select(func.count()).select_from(SuppressionHash)
+                              .where(SuppressionHash.reason == "unsubscribe")).scalar_one()
+        bounce_ct = s2.execute(select(func.count()).select_from(SuppressionHash)
+                               .where(SuppressionHash.reason == "bounce_hard")).scalar_one()
+        complaint_ct = s2.execute(select(func.count()).select_from(SuppressionHash)
+                                  .where(SuppressionHash.reason == "complaint")).scalar_one()
+        erasure_ct = s2.execute(select(func.count()).select_from(SuppressionHash)
+                                .where(SuppressionHash.reason == "erasure_request")).scalar_one()
     dl_svg = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>'
     body = f"""
 <div class="page-head">
@@ -3590,7 +3841,7 @@ def suppression_view(session=Depends(require_session), reason: str = ""):
 </div>
 <p class="dim mt">Showing up to 500 entries. Emails shown only for contacts in your local DB.</p>
 {_config_section("Suppression config",
-    '<div class="callout warn" style="margin-bottom:16px">⚠ Set these secrets before sending to real recipients. Once set and emails are sent, <b>do not change them</b> - existing unsubscribe links will break. Generate a random value and save.'
+    '<div class="callout warn" style="margin-bottom:16px">\u26A0 Set these secrets before sending to real recipients. Once set and emails are sent, <b>do not change them</b> - existing unsubscribe links will break. Generate a random value and save.'
     '<div style="margin-top:10px"><button class="btn sm" onclick="generateHmacSecrets()">Generate both secrets</button></div></div>'
     '<script>function generateHmacSecrets(){{var a=Array.from(crypto.getRandomValues(new Uint8Array(32))).map(b=>b.toString(16).padStart(2,"0")).join("");var b=Array.from(crypto.getRandomValues(new Uint8Array(32))).map(b=>b.toString(16).padStart(2,"0")).join("");var f1=document.querySelector(\'input[name="unsub_secret"]\');var f2=document.querySelector(\'input[name="erasure_secret"]\');if(f1)f1.value=a;if(f2)f2.value=b;}}</script>' +
     _setting_row("unsub_secret", "Unsubscribe signing secret", is_secret=True,
@@ -3598,9 +3849,9 @@ def suppression_view(session=Depends(require_session), reason: str = ""):
     _setting_row("erasure_secret", "Erasure request signing secret", is_secret=True,
                  help="HMAC key used to sign erasure request tokens. Sync'd to cloud on save.") +
     _setting_row("unsub_token_ttl_s", "Unsubscribe token TTL (seconds)", kind="number",
-                 help="Default: 604800 (7 days). How long an unsubscribe link stays valid.") +
+                 help="Default: 31536000 (365 days). How long an unsubscribe link stays valid.") +
     _setting_row("erasure_token_ttl_s", "Erasure token TTL (seconds)", kind="number",
-                 help="Default: 86400 (24 hours). How long an erasure request link stays valid.")
+                 help="Default: 2592000 (30 days). How long an erasure request link stays valid.")
 )}
 """
     return _layout("Suppression List", body, "/admin/suppression", session)
@@ -3610,11 +3861,12 @@ def suppression_view(session=Depends(require_session), reason: str = ""):
 def suppression_csv(session=Depends(require_session)):
     import hashlib as _hl
     from fastapi.responses import Response
-    with db.conn() as c:
-        sup_rows = c.execute(
-            "SELECT email_hash, reason, source, added_at FROM suppression_hashes ORDER BY added_at DESC"
-        ).fetchall()
-        contacts = c.execute("SELECT email FROM contacts").fetchall()
+    with db.session() as s:
+        sup_rows = s.execute(
+            select(SuppressionHash.email_hash, SuppressionHash.reason, SuppressionHash.source, SuppressionHash.added_at)
+            .order_by(SuppressionHash.added_at.desc())
+        ).mappings().all()
+        contacts = s.execute(select(Contact.email)).mappings().all()
     h2email: dict[str, str] = {}
     for row in contacts:
         em = row["email"]
@@ -3637,10 +3889,11 @@ def operators_view(session=Depends(require_session)):
     # role check
     if session.get("role", "admin") != "admin":
         return HTMLResponse("<p>Admin access required.</p>", status_code=403)
-    with db.conn() as c:
-        rows = c.execute(
-            "SELECT id, email, role, active, created_at, last_login_at FROM operators ORDER BY id"
-        ).fetchall()
+    with db.session() as s:
+        rows = s.execute(
+            select(Operator.id, Operator.email, Operator.role, Operator.active, Operator.created_at,
+                   Operator.last_login_at).order_by(Operator.id)
+        ).mappings().all()
 
     current_email = session.get("sub", "")
     ROLE_PILL = {"admin": "accent", "operator": "info"}
@@ -3677,7 +3930,7 @@ def operators_view(session=Depends(require_session)):
     body = f"""
 <div class="page-head">
   <div class="titles">
-    <div class="eyebrow">Team · admin only</div>
+    <div class="eyebrow">Team \u00B7 admin only</div>
     <h1 class="page-title">Operators</h1>
     <p class="page-sub">Accounts with access to this vault. Admins manage operators and roles; operators can run campaigns but not change team membership.</p>
   </div>
@@ -3699,7 +3952,7 @@ def operators_view(session=Depends(require_session)):
   <div class="modal-body">
     <form method="post" action="/admin/operators/create" id="add-op-form">
       <div class="field"><label>Email</label><input type="email" name="email" required placeholder="teammate@example.com"></div>
-      <div class="field"><label>Password <span class="hint">≥ 12 chars</span></label><input type="password" name="password" required minlength="12" placeholder="••••••••••••"></div>
+      <div class="field"><label>Password <span class="hint">\u2265 12 chars</span></label><input type="password" name="password" required minlength="12" placeholder="\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"></div>
       <div class="field" style="margin-bottom:0"><label>Role</label><select name="role"><option value="operator">operator</option><option value="admin">admin</option></select></div>
     </form>
   </div>
@@ -3716,7 +3969,7 @@ def operators_view(session=Depends(require_session)):
 {_config_block("Change admin password", """
 <p style='font-size:.9em;color:#555;margin:.3em 0 1em'>Changes take effect immediately. You will remain signed in.</p>
 <form method='post' action='/admin/settings/auth/password' style='max-width:380px;margin:0'>
-  <label style='display:block;margin:.4em 0 .2em;font-size:.9em'>New password (≥ 12 chars)
+  <label style='display:block;margin:.4em 0 .2em;font-size:.9em'>New password (\u2265 12 chars)
     <input type='password' name='new_password' required minlength='12'
            style='display:block;width:100%;margin-top:.2em'></label>
   <label style='display:block;margin:.6em 0 .2em;font-size:.9em'>Confirm password
@@ -3777,22 +4030,22 @@ def operators_delete(op_id: int, session=Depends(require_session)):
 
 _DOCS = [
     ("Getting started", "setup onboarding install sign in login", """
-Start the terminal with <code>bin/v3 up-terminal</code>.
+Start the terminal with <code>scripts/v3 up-terminal</code>.
 Sign in at <b>/admin</b> with your operator credentials.
 The terminal syncs with the cloud Lambda every 5 seconds once the handshake is complete.
 Settings are inline on each feature page - there is no separate Settings tab.
 """),
     ("Handshake", "handshake keypair operator client init bootstrap token", """
-Run <code>bin/v3 init-handshake --role operator --cloud &lt;CLOUD_URL&gt; --bootstrap-token &lt;TOKEN&gt;</code>
-during a screen-share session with the client. Both sides must run the handshake once.
+Handshake helper: <code>scripts/v3 init-handshake --role operator --cloud &lt;CLOUD_URL&gt; --bootstrap-token &lt;TOKEN&gt;</code>
+(see Known limitations in the README). Both sides register once during a screen-share session.
 After handshake, the terminal stores a bearer token and NaCl keypair in its volume.
-The bootstrap token is one-time-use and is invalidated after handshake completes.
+The bootstrap token remains valid after handshake and is required to revoke a terminal's public key and bearer tokens.
 """),
     ("Contacts &amp; CSV import", "contacts import csv tags suppression bulk upload", """
 Contacts are stored locally in the terminal SQLite DB.
 Add individually via the Contacts tab or bulk-import via <b>Upload CSV</b>.
 CSV columns: <code>email</code> (required), <code>name</code>, <code>tags</code>, <code>consent_source</code>, <code>external_id</code>.
-Tags are pipe-separated strings (e.g. <code>beta|vip</code>). Max 10,000 rows per upload.
+Tags are pipe-separated strings (e.g. <code>beta|vip</code>). Uploads are sent in 10,000-row chunks.
 Suppressed addresses are skipped automatically during import.
 """),
     ("Contact segmentation", "segment tag filter campaign recipients by-tag bulk add", """
@@ -3802,32 +4055,32 @@ The tag filter on the Contacts page (search box) also narrows the list.
 Tags are matched with an exact prefix - <code>beta</code> matches contacts tagged <code>beta</code> or <code>beta|vip</code>.
 """),
     ("Templates &amp; preview", "template html subject from-name variable substitution preview render", """
-Templates use double-brace variables: <code>{{name}}</code>, <code>{{email}}</code>, <code>{{firstName}}</code>, <code>{{company}}</code>, <code>{{unsubscribeUrl}}</code>, <code>{{previewText}}</code>.
+Templates use double-brace variables: <code>{{name}}</code>, <code>{{email}}</code>, <code>{{firstName}}</code>, <code>{{companyName}}</code>, <code>{{unsubscribeUrl}}</code>, <code>{{erasureUrl}}</code>.
 Available variables are listed on the Templates page.
 Use the <b>Preview</b> link on any template to see it rendered with sample data before sending.
 The inline preview panel on the template detail page updates as you type in the name/email fields.
-Templates are encrypted at rest and never leave the vault in plaintext.
+Templates are stored in plaintext in the local SQLite DB. The terminal encrypts rendered send jobs; the cloud dispatcher decrypts them with a temporary key to call Resend. Open tracking is off.
 """),
     ("Campaigns", "campaign launch dispatch send promotional transactional scheduled", """
 Create a campaign, assign a template and kind (<b>promotional</b> or <b>transactional</b>).
 Optionally set a <b>scheduled for</b> datetime - the scheduler loop will launch it automatically.
-Mark it tested, then launch. Launch enqueues one job per contact via SQS.
+Mark it tested, then launch. Launch pushes batch 1; packs that are due go to SQS, and later ones wait for the dispatcher's sweep.
 The ep-dispatcher Lambda picks up jobs, decrypts, and POSTs to Resend.
-Transactional campaigns bypass suppression lists; promotional ones honour them.
-The <b>K_temp TTL</b> setting (Overview page ⚙ Config) controls how long pack decryption keys live.
+Promotional campaigns respect promotional and all-scope unsubscribes; transactional campaigns respect all-scope unsubscribes. Non-unsubscribe suppressions block both kinds.
+The <b>K_temp TTL</b> setting (Overview page \u2699 Config) controls how long pack decryption keys live.
 """),
     ("Campaign analytics", "analytics opened clicked bounced complained stats rates", """
 After dispatch, click <b>Analytics</b> on any campaign to see delivery stats.
-Summary row: Sent / Opened / Clicked / Bounced / Complained / Failed with counts and rates.
+Summary row: Sent / Clicked / Bounced / Failed with counts and rates. Open tracking is off.
 Per-recipient table shows individual status, timestamps, and message IDs.
 Stats are populated by the inbox materialiser - Resend webhook events are synced from the cloud,
 decrypted, and applied to <code>campaign_recipients</code> every 10 seconds.
 """),
     ("Scheduled campaigns", "schedule scheduled_for auto-launch timer trigger", """
-Set <b>Scheduled for</b> when creating a campaign to queue it for automatic dispatch.
+Set <b>Schedule</b> when creating a campaign, or press <b>Schedule</b> on a tested campaign, to launch it automatically at that time. Times are entered and shown in your browser's time zone and stored in UTC. It launches only if it has been marked tested by then: marking a scheduled campaign tested keeps it scheduled. Pause takes it off the schedule; after Resume, schedule it again.
 The scheduler loop checks every 60 seconds for campaigns whose <code>scheduled_for</code> is in the past.
-On trigger, it calls the same launch path as a manual launch - one job per contact via SQS.
-If launch fails, a WARN drift event is written; the campaign remains in <code>scheduled</code> status for retry.
+On trigger, it calls the same launch path as a manual launch. Launch pushes batch 1; packs that are due go to SQS, and later ones wait for the dispatcher's sweep.
+If the launch is refused for a reason only you can fix (no test send, an unfilled template variable, a missing company or Resend key), the campaign moves to <code>failed</code>, one WARN drift event and one audit entry record the reason, and its Analytics page shows it. Fix the cause, mark it tested again, then launch or schedule it. If there is no cloud handshake yet, the cloud cannot be reached, or its recipients are still locked by another campaign, it stays <code>scheduled</code>, its Analytics page shows why, and the next check tries again. If unexpected errors keep it from launching for a day, it moves to <code>failed</code>. Time the terminal is offline counts toward that day.
 """),
     ("Re-queue failed sends", "retry failed requeue reset status", """
 On a campaign's Analytics page, the <b>Retry Failed</b> button resets all <code>failed</code> recipients back to <code>queued</code>.
@@ -3839,7 +4092,7 @@ The Suppression page lists all suppressed addresses (stored as SHA-256 hashes).
 Emails are resolved from your local contacts DB where possible; unknown hashes show -.
 Filter by reason: <code>unsubscribe</code>, <code>complaint</code>, <code>bounce_hard</code>, <code>manual</code>, <code>erasure_request</code>.
 Export the full list as CSV with the <b>Export CSV</b> button.
-Suppression secrets and token TTLs live in the ⚙ Suppression config section at the bottom of this page.
+Suppression secrets and token TTLs live in the \u2699 Suppression config section at the bottom of this page.
 """),
     ("Entities &amp; senders", "company domain resend key multi-tenant per-company sender brand", """
 Entities let you send from multiple domains, each with its own Resend API key.
@@ -3847,56 +4100,57 @@ Create a company via the <b>Entities</b> tab: name, domain, from-name, from-emai
 Set its Resend key via <b>Set Key</b> - encrypted at rest, never stored in plaintext.
 When creating a campaign, select a company from the dropdown to use its key + domain.
 If no company is selected, the global <code>resend_api_key</code> setting is used.
-Brand settings (company name, support email, global sender) are in ⚙ Brand &amp; sender config at the bottom of the Entities page.
+Brand settings (company name, support email, global sender) are in \u2699 Brand &amp; sender config at the bottom of the Entities page.
 """),
     ("Multi-operator logins", "operators team login user role admin password invite", """
 Manage team members on the <b>Operators</b> page (admin-only).
 Each operator has their own email/password and an <code>admin</code> or <code>operator</code> role.
 Admins can add, deactivate, or delete other operators; operators cannot.
 On startup the platform migrates legacy <code>admin_email</code>/<code>admin_password_hash</code> settings to the operators table.
-Session TTL, password change, and JWT rotation are in the ⚙ config sections at the bottom of the Operators page.
+Session TTL, password change, and JWT rotation are in the \u2699 config sections at the bottom of the Operators page.
 """),
     ("Settings - where to find them", "settings config inline jwt secret password session ttl", """
 Settings are now inline on the feature page that owns them - no separate Settings tab.
 <ul style='margin:.4em 0;padding-left:1.3em;line-height:1.8'>
-  <li><b>Overview</b> ⚙ - K_temp TTL</li>
-  <li><b>Entities</b> ⚙ - brand, global sender, Resend API key, cloud cross-call</li>
-  <li><b>Suppression</b> ⚙ - unsub/erasure secrets, token TTLs</li>
-  <li><b>Operators</b> ⚙ - session TTL, change password, rotate JWT</li>
+  <li><b>Overview</b> \u2699 - K_temp TTL</li>
+  <li><b>Entities</b> \u2699 - brand, global sender, Resend API key, cloud cross-call</li>
+  <li><b>Suppression</b> \u2699 - unsub/erasure secrets, token TTLs</li>
+  <li><b>Operators</b> \u2699 - session TTL, change password, rotate JWT</li>
 </ul>
-All settings are encrypted at rest in the terminal SQLite DB. On first boot, values are migrated from the <code>.env</code> file.
+Only secret settings are encrypted at rest in the terminal SQLite DB; other settings are stored in plaintext. On first boot, known environment values are migrated without overwriting existing rows.
 Old <code>/admin/settings/*</code> URLs redirect to the new locations.
 """),
     ("Sync protocol", "sync pull push cursor bearer token encryption", """
 The terminal short-polls <code>GET /sync/pull?since=N</code> every 5 seconds.
-Events are encrypted with a NaCl box (terminal pubkey -> cloud privkey) before transit.
+Webhook and suppression payloads use AES-256-GCM with a per-payload key wrapped via NaCl SealedBox to both terminals' public keys. Each terminal decrypts its wrap with its own private key.
 The sync cursor advances monotonically; missed events are replayed on reconnect.
 Push path: terminal <code>POST /sync/push</code> -> cloud stores event -> Lambda reads on next pull.
 Bearer token is stored in <code>KEYS_DIR/cloud_bearer.txt</code> after handshake.
 """),
     ("Inbox materialiser", "materialiser webhook inbox opened clicked bounced", """
-Webhook events from Resend (opened/clicked/bounced/complained) are synced from the cloud,
+Webhook events from Resend are synced from the cloud,
 decrypted, and applied to <code>campaign_recipients</code> every 10 seconds by the materialiser loop.
+Opened events are ignored; open tracking is off.
 Suppression events (unsubscribe hash synced from cloud) are also applied here.
 If the KeyBundle is not yet ready (handshake not run), materialisation is skipped and retried next tick.
 Check <code>GET /sync/status</code> for pending inbox event counts.
 """),
     ("Drift detection", "drift critical warn acknowledged category job", """
-Drift events are recorded when a dispatched job's outcome differs from the expected state.
-CRITICAL drift = delivery failure after all retries. WARN = soft anomaly (e.g. scheduler launch failure).
+Only the legacy WireGuard sync records CRITICAL drift, for <code>missing_on_vault</code> and <code>content_mismatch</code>.
+WARN drift includes scheduler launch failures and jobs missing on the legacy edge.
 Acknowledge drift events via the Drift tab or <code>POST /sync/drift/&lt;id&gt;/ack</code>.
 Unacked CRITICAL drift appears as a red badge on the Overview.
 """),
     ("Backup", "backup snapshot restore", """
-Run <code>bin/v3 backup</code> to create a point-in-time snapshot of the terminal volume.
-Snapshots are stored in <code>backups/</code> as encrypted tarballs.
-The cloud Lambda holds no plaintext data - the terminal DB is the source of truth.
+Backup helper: <code>scripts/v3 backup</code> (see Known limitations in the README).
+Snapshots are stored in <code>backups/</code> as ZIP archives containing encrypted SQLite, key and optional DynamoDB snapshots.
+The cloud dispatcher decrypts rendered send jobs with a temporary key to call Resend; contacts and templates are stored locally.
 """),
     ("Lambda deployment", "lambda deploy aws api gateway sqs dispatcher", """
-Deploy the API Lambda: <code>bin/v3 deploy-api</code>.
-Deploy the dispatcher Lambda: <code>bin/v3 deploy-dispatcher</code>.
-The dispatcher is triggered by SQS; wired automatically on first deploy.
-Tail CloudWatch logs with <code>bin/v3 tail-api</code> and <code>bin/v3 tail-dispatcher</code>.
+API deployment helper: <code>scripts/v3 deploy-api</code> (see Known limitations in the README).
+Dispatcher deployment helper: <code>scripts/v3 deploy-dispatcher</code> (see Known limitations in the README).
+The dispatcher helper wires its SQS trigger on first creation.
+Tail CloudWatch logs with <code>scripts/v3 tail-api</code> and <code>scripts/v3 tail-dispatcher</code>.
 IAM policies are in <code>deploy/iam/</code>.
 """),
 ]
@@ -3921,7 +4175,7 @@ def docs_view(session=Depends(require_session)):
 </div>
 <div style="position:relative;margin-bottom:8px">
   <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="var(--text-dim)" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="position:absolute;left:12px;top:50%;transform:translateY(-50%)"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
-  <input type="search" id="q" placeholder="Search the docs…" style="padding-left:36px;font-size:14px;padding-top:10px;padding-bottom:10px;max-width:440px" oninput="filter()">
+  <input type="search" id="q" placeholder="Search the docs\u2026" style="padding-left:36px;font-size:14px;padding-top:10px;padding-bottom:10px;max-width:440px" oninput="filter()">
 </div>
 <div id="noResults" class="empty" style="display:none">
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
