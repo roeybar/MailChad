@@ -19,6 +19,15 @@ os.environ.setdefault("AWS_ACCESS_KEY_ID", "test")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "test")
 os.environ.setdefault("DYNAMODB_TABLE", "ep-v3-test")
 
+# Product modules read these paths at import time and default to /var/lib/...,
+# which a CI runner cannot write. Point them all at one per-session temp folder;
+# assigned, not setdefault, so a run inside the live container never touches its data.
+_TEST_STATE_ROOT = Path(tempfile.mkdtemp(prefix="mailman-test-"))
+os.environ["VAULT_DB_PATH"] = str(_TEST_STATE_ROOT / "vault.sqlite")
+os.environ["TERMINAL_KEYS_DIR"] = str(_TEST_STATE_ROOT / "terminal-keys")
+os.environ["CLOUD_DB_PATH"] = str(_TEST_STATE_ROOT / "cloud.sqlite")
+os.environ["CLOUD_KEYS_DIR"] = str(_TEST_STATE_ROOT / "cloud-keys")
+
 PROJECT_ROOT = Path(__file__).parent.parent
 
 
