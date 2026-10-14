@@ -33,6 +33,13 @@ log = logging.getLogger("vault.admin")
 router = APIRouter(prefix="/admin", dependencies=[Depends(require_session)])
 
 
+def _require_admin(session: dict = Depends(require_session)) -> dict:
+    """Route dependency: the operator-account routes are for admins only, as on the HTML pages."""
+    if session.get("role", "admin") != "admin":
+        raise HTTPException(403, "admin role required")
+    return session
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -902,7 +909,7 @@ class OperatorIn(BaseModel):
     role: str = "operator"
 
 
-@router.get("/operators")
+@router.get("/operators", dependencies=[Depends(_require_admin)])
 def list_operators():
     with db.session() as s:
         rows = [dict(r) for r in s.execute(
@@ -912,9 +919,8 @@ def list_operators():
     return {"operators": rows}
 
 
-@router.post("/operators")
+@router.post("/operators", dependencies=[Depends(_require_admin)])
 def create_operator(body: OperatorIn, session=Depends(require_session)):
-    from mailman.terminal.auth import require_admin
     import bcrypt as _bcrypt
     if body.role not in ("admin", "operator"):
         raise HTTPException(400, "role must be admin or operator")
@@ -935,7 +941,7 @@ def create_operator(body: OperatorIn, session=Depends(require_session)):
     return {"id": new_id}
 
 
-@router.post("/operators/{op_id}/toggle-active")
+@router.post("/operators/{op_id}/toggle-active", dependencies=[Depends(_require_admin)])
 def toggle_operator_active(op_id: int):
     with db.session() as s:
         row = s.execute(select(Operator.active).where(Operator.id == op_id)).mappings().first()
@@ -950,7 +956,7 @@ def toggle_operator_active(op_id: int):
     return {"active": new_state}
 
 
-@router.delete("/operators/{op_id}")
+@router.delete("/operators/{op_id}", dependencies=[Depends(_require_admin)])
 def delete_operator(op_id: int, session=Depends(require_session)):
     with db.session() as s:
         if not s.execute(select(Operator.id).where(Operator.id == op_id)).first():
