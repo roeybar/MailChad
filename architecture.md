@@ -52,7 +52,11 @@ key. See Known limitations in the README for the handshake helper.
 
 ### Section 2.2 - Two encryption modes
 
-- **`K_op_pub + K_cl_pub` mode** - random per-payload AES-256-GCM key, wrapped twice with NaCl SealedBox. Either party decrypts its wrap with its own private key. Used by the cloud for webhook and suppression events.
+- **`K_op_pub + K_cl_pub` mode** - random per-payload AES-256-GCM key, wrapped
+  twice with NaCl SealedBox. Either party decrypts its wrap with its own private
+  key. Webhook events, and suppressions derived from them, are encrypted to both
+  terminals' public keys; one-click unsubscribes are stored and synced as SHA-256
+  email hashes.
 - **`K_temp` mode** - symmetric AES-256-GCM with K_temp. The dispatcher decrypts packs with the active key.
 
 ### Section 2.3 - K_temp lifecycle
@@ -233,7 +237,7 @@ Run the default suite inside the project's test container:
 bash scripts/v3 test
 ```
 
-The October 2026 baseline is 645 passed, 1 skipped. AWS and Resend are mocked;
+The October 2026 baseline is 650 passed, 1 skipped. AWS and Resend are mocked;
 the real-send path has not been run against Resend for this release.
 
 - `tests/test_sync_protocol.py` covers push/pull, auth and near-conflicts.
