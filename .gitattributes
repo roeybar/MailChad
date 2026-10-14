@@ -1,0 +1,10 @@
+# Files that run under sh/bash or inside the Linux images keep LF line ends
+# on every checkout and archive, whatever core.autocrlf says.
+# Every tracked blob is already LF, so this renormalises nothing.
+*.sh              text eol=lf
+*.Dockerfile      text eol=lf
+scripts/v3        text eol=lf
+scripts/_check/*  text eol=lf
+scripts/_probe/*  text eol=lf
+scripts/*.py      text eol=lf
+deploy/*.py       text eol=lf
