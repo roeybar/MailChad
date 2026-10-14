@@ -41,3 +41,7 @@ handoff.md
 cloud_bearer.txt
 *.7z
 restore-point/
+
+*.zip
+*.tar
+*.pem
