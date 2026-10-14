@@ -111,9 +111,6 @@ cmd_probe() {
 }
 
 cmd_admin_bcrypt() {
-  if ! docker image inspect email-platform-v3-terminal >/dev/null 2>&1; then
-    docker compose build terminal >/dev/null
-  fi
   if [ -t 0 ]; then
     printf "Password (hidden): " >&2
     stty -echo; read pw; echo >&2; stty echo
@@ -121,7 +118,8 @@ cmd_admin_bcrypt() {
     read pw
   fi
   [ -n "$pw" ] || { echo "empty"; exit 1; }
-  printf '%s' "$pw" | docker run --rm -i email-platform-v3-terminal python -c "
+  [ -f "$PROJECT_ROOT/.env" ] || { fail "create .env first: cp .env.example .env"; exit 1; }
+  printf '%s' "$pw" | docker compose run --rm --no-deps -T terminal python -c "
 import sys, bcrypt
 pw = sys.stdin.read().rstrip('\n').encode()
 print(bcrypt.hashpw(pw, bcrypt.gensalt(rounds=12)).decode())
