@@ -1,4 +1,4 @@
-"""Tests for sync protocol - §3, §10.1."""
+"""Tests for sync protocol - section 3, section 10.1."""
 import base64
 import sys
 from pathlib import Path
@@ -110,7 +110,7 @@ def test_near_conflict_detected(client_and_bearers):
 
 
 def test_no_conflict_when_same_actor(client_and_bearers):
-    """Same actor writing twice within 60s ≠ conflict (operator just iterating)."""
+    """Same actor writing twice within 60s != conflict (operator just iterating)."""
     c, op_bearer, _ = client_and_bearers
     c.post("/sync/push",
         json=[_event("templates", "iter", 1, modified_at="2026-05-19T01:00:00Z")],

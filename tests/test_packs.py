@@ -1,4 +1,4 @@
-"""Tests for pack lifecycle - §4, §10.3."""
+"""Tests for pack lifecycle - section 4, section 10.3."""
 import base64
 import json
 import os
