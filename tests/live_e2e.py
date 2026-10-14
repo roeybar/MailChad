@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-ep-v3 live e2e tester - v4 (v3.18 edition)
+MailMan live e2e (3.24)
 Runs inside the terminal container against localhost:8000.
 
 Tests: auth, all frontend pages, contacts, templates, campaigns, entities,
-       suppression, stress, failures, wacky interactions, real email send.
+       suppression, stress, failures, wacky interactions.
 
-Usage (from project root):
-    docker cp tests/live_e2e.py ep-v3-terminal:/tmp/live_e2e.py
-    docker compose exec terminal python /tmp/live_e2e.py
+See docs/LIVE-E2E.md. The real-send leg always skips; its prerequisites
+include E2E_REAL_SEND=1, explicit E2E_REAL_SEND_TO recipients and this project's own key.
 """
 from __future__ import annotations
 
+import functools
 import httpx
 import json
 import sys
@@ -21,8 +21,8 @@ from dataclasses import dataclass
 
 import os as _os
 BASE   = _os.environ.get("E2E_BASE", "http://localhost:8000")
-ADMIN  = _os.environ.get("E2E_ADMIN", "admin")    # restored client DB: admin@localhost
-PASSWD = _os.environ.get("E2E_PASSWD", "1234")    # restored client DB: changeme
+ADMIN  = _os.environ.get("E2E_ADMIN")
+PASSWD = _os.environ.get("E2E_PASSWD")
 TARGET_EMAILS = [
     "target1.epv3@example.com",
     "target2.epv3@example.com",
@@ -32,6 +32,11 @@ TARGET_EMAILS = [
 # Real Lambda endpoint - read from terminal settings at runtime
 import os as _os
 _CLOUD_URL = _os.environ.get("CLOUD_URL", "")
+REAL_SEND_ON = _os.environ.get("E2E_REAL_SEND", "") == "1"
+REAL_SEND_TO = [a.strip().lower() for a in _os.environ.get("E2E_REAL_SEND_TO", "").split(",") if a.strip()]
+REAL_SEND_RESERVED_DOMAINS = (
+    "example.com", "example.net", "example.org", "test", "example", "invalid", "localhost",
+)
 
 # result tracking
 
@@ -45,15 +50,15 @@ results: list[Result] = []
 
 def ok(name: str, note: str = "") -> None:
     results.append(Result(name, True, note))
-    print(f"  \033[32m✓\033[0m {name}" + (f"  ({note})" if note else ""))
+    print(f"  \033[32m\u2713\033[0m {name}" + (f"  ({note})" if note else ""))
 
 def fail(name: str, note: str = "") -> None:
     results.append(Result(name, False, note))
-    print(f"  \033[31m✗\033[0m {name}" + (f"  ({note})" if note else ""))
+    print(f"  \033[31m\u2717\033[0m {name}" + (f"  ({note})" if note else ""))
 
 def skip(name: str, reason: str) -> None:
     results.append(Result(name, True, f"SKIP: {reason}"))
-    print(f"  \033[33m–\033[0m {name}  (skipped: {reason})")
+    print(f"  \033[33m\u2013\033[0m {name}  (skipped: {reason})")
 
 def section(title: str) -> None:
     print(f"\n\033[1m{title}\033[0m")
@@ -70,26 +75,15 @@ def new_client() -> httpx.Client:
 def login(client: httpx.Client) -> None:
     client.post("/admin/auth/login", data={"email": ADMIN, "password": PASSWD})
 
-def ensure_resend_key() -> bool:
-    """Inject resend key from coherence/.env if not already set. Returns True if key available."""
-    import sys; sys.path.insert(0, "/app")
-    from mailman.terminal import settings as _s
-    if _s.get("resend_api_key"):
-        return True
-    try:
-        for line in open("/host-coherence-env", "rb").read().decode().splitlines():
-            if line.startswith("RESEND_API_KEY="):
-                key = line.split("=", 1)[1].strip().strip("'\"")
-                _s.set("resend_api_key", key)
-                return True
-    except Exception:
-        pass
-    return bool(_s.get("resend_api_key"))
 
 def cleanup_e2e_data() -> None:
     import sys; sys.path.insert(0, "/app")
     from mailman.terminal import db as _db
-    with _db.conn() as c:
+    import sqlite3
+    from contextlib import closing
+    with closing(sqlite3.connect(str(_db.DB_PATH), timeout=10)) as c:
+        c.row_factory = sqlite3.Row
+        c.execute("PRAGMA foreign_keys = ON")
         e2e_emails = c.execute(
             "SELECT id FROM contacts WHERE email LIKE '%.epv3@%' OR email LIKE '%wacky%' "
             "OR email LIKE '%overlap%' OR email LIKE '%stress%'"
@@ -104,6 +98,7 @@ def cleanup_e2e_data() -> None:
         c.execute("DELETE FROM campaigns WHERE name LIKE 'e2e-%'")
         c.execute("DELETE FROM templates WHERE name LIKE 'e2e-%'")
         c.execute("DELETE FROM entities WHERE name LIKE 'e2e-%' OR name LIKE 'E2E%'")
+        c.execute("DELETE FROM seed_addresses WHERE email = 'seed-e2e@example.com'")
         c.commit()
     print("  pre-flight cleanup done")
 
@@ -113,11 +108,27 @@ def _clear_e2e_locks() -> None:
     exercising the lock can proceed (sets lock_until in the past + confirms)."""
     import sys; sys.path.insert(0, "/app")
     from mailman.terminal import db as _db
-    with _db.conn() as c:
+    import sqlite3
+    from contextlib import closing
+    with closing(sqlite3.connect(str(_db.DB_PATH), timeout=10)) as c:
+        c.row_factory = sqlite3.Row
+        c.execute("PRAGMA foreign_keys = ON")
         c.execute("UPDATE campaigns SET lock_until=datetime('now','-2 days'), "
                   "unsubs_confirmed_at=datetime('now') "
                   "WHERE name LIKE 'e2e-%' AND dispatched_at IS NOT NULL")
         c.commit()
+
+
+def agent_token_refusal() -> str | None:
+    """Reason to refuse when the terminal has an agent token set (value never printed).
+
+    Earlier versions had a remote agent API that stored an agent_token setting; the script refuses a terminal that still holds one so it is not pointed at an old deployment by mistake.
+    """
+    sys.path.insert(0, "/app")
+    from mailman.terminal import settings as _s
+    if _s.get("agent_token"):
+        return "the agent_token setting is set on this terminal; clear it before running"
+    return None
 
 # test sections
 
@@ -174,7 +185,7 @@ def test_nav_pages(client: httpx.Client) -> None:
 
     r = client.get("/admin/docs")
     check("Docs has search input",    'type="search"' in r.text or 'doc-search' in r.text)
-    check("Docs has ≥9 sections",     r.text.count("doc-section") >= 9)
+    check("Docs has \u22659 sections",     r.text.count("doc-section") >= 9)
     check("Docs mentions entities",  "entit" in r.text.lower())
 
     for _ in range(3): client.get("/admin")
@@ -209,7 +220,11 @@ def test_contacts(client: httpx.Client) -> dict[str, int]:
     if len(contact_ids) < len(TARGET_EMAILS):
         import sys; sys.path.insert(0, "/app")
         from mailman.terminal import db as _db
-        with _db.conn() as c:
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(_db.DB_PATH), timeout=10)) as c:
+            c.row_factory = sqlite3.Row
+            c.execute("PRAGMA foreign_keys = ON")
             for email in TARGET_EMAILS:
                 if email not in contact_ids:
                     row = c.execute("SELECT id FROM contacts WHERE email=?", (email,)).fetchone()
@@ -230,14 +245,14 @@ def test_contacts(client: httpx.Client) -> dict[str, int]:
     check("duplicate email -> 409", r.status_code == 409)
 
     for case, email, name in [
-        ("emoji name",       "emoji.test.epv3@example.com",   "Tester 🎉🔥💀"),
+        ("emoji name",       "emoji.test.epv3@example.com",   "Tester \U0001F389\U0001F525\U0001F480"),
         ("500-char name",    "longname.test.epv3@example.com", "A" * 500),
         ("XSS name",         "xss.test.epv3@example.com",     "<script>alert('xss')</script>"),
         ("tabs/newlines",    "weird.test.epv3@example.com",   "Name\twith\ttabs"),
         ("emoji tags",       "tags.epv3@example.com",         "Tag test"),
     ]:
         r = client.post("/admin/contacts", json={
-            "email": email, "name": name, "tags": "e2e|🔥",
+            "email": email, "name": name, "tags": "e2e|\U0001F525",
             "consent_ts": "2026-01-01T00:00:00Z", "consent_source": "edge",
         })
         check(f"contact with {case}", r.status_code == 200, f"got {r.status_code}")
@@ -292,7 +307,7 @@ def test_templates(client: httpx.Client) -> int | None:
     section("TEMPLATES")
     r = client.post("/admin/templates", json={
         "name": "e2e-main",
-        "subject": "ep-v3 live test - hello {{firstName}} 👋",
+        "subject": "ep-v3 live test - hello {{firstName}} \U0001F44B",
         "from_name": "ep-v3 Tester",
         "html_body": (
             "<h1>Hi {{firstName}},</h1>"
@@ -305,8 +320,8 @@ def test_templates(client: httpx.Client) -> int | None:
 
     for name, subject, body in [
         ("e2e-static",   "Static - no vars",       "<p>Static.</p>"),
-        ("e2e-unicode",  "你好 {{firstName}} - שלום", "<p>Unicode.</p>"),
-        ("e2e-emoji",    "🎉🔥💀🚀",                 "<p>Emoji subject.</p>"),
+        ("e2e-unicode",  "\u4F60\u597D {{firstName}} - \u05E9\u05DC\u05D5\u05DD", "<p>Unicode.</p>"),
+        ("e2e-emoji",    "\U0001F389\U0001F525\U0001F480\U0001F680",                 "<p>Emoji subject.</p>"),
         ("e2e-xss-body", "XSS body test",           "<script>alert('xss-body')</script><p>ok</p>"),
     ]:
         r = client.post("/admin/templates", json={
@@ -344,7 +359,7 @@ def test_templates(client: httpx.Client) -> int | None:
     # template save (edit)
     if main_id:
         r = client.post(f"/admin/templates/{main_id}/save", data={
-            "name": "e2e-main", "subject": "ep-v3 live test - hello {{firstName}} 👋",
+            "name": "e2e-main", "subject": "ep-v3 live test - hello {{firstName}} \U0001F44B",
             "from_name": "ep-v3 Tester Updated", "html_body": "<h1>Updated</h1>",
         })
         check("template save -> redirect", r.status_code == 303, f"got {r.status_code}")
@@ -396,11 +411,11 @@ def test_entities(client: httpx.Client) -> tuple[int | None, int | None]:
     r = client.post("/admin/entities", json={"name": "E2E MissingDomain"})
     check("entity missing domain -> 422", r.status_code == 422, f"got {r.status_code}")
 
-    # set key via form (as browser does)
+    # Set key via JSON (as the key modal does)
     if co_id:
         r = client.post(f"/admin/entities/{co_id}/set-key",
-                        data={"resend_api_key": "re_e2e_fake_key_for_test"})
-        check("set entity key (form) -> redirect", r.status_code == 303, f"got {r.status_code}")
+                        json={"resend_api_key": "re_e2e_fake_key_for_test"})
+        check("set entity key -> 200 JSON", r.status_code == 200 and r.json() == {"key_set": True}, f"got {r.status_code}")
 
         # verify key_set flag via JSON API
         r = client.get(f"/admin/entities/{co_id}")
@@ -467,18 +482,20 @@ def test_campaigns(client: httpx.Client, tmpl_id: int, contact_ids: dict[str, in
 
         client.post(f"/admin/campaigns/{camp_id}/mark-tested")
 
-        r = client.post(f"/admin/campaigns/{camp_id}/launch")
-        body = r.text[:300]
-        if r.status_code == 200 and "error" not in r.text.lower():
-            d = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
-            ok("REAL SEND (global key)", f"dispatched={d.get('dispatched','?')} suppressed={d.get('suppressed','?')}")
-            r2 = client.post(f"/admin/campaigns/{camp_id}/launch")
-            check("re-launch already-dispatched -> error",
-                  r2.status_code != 200 or "error" in r2.text.lower())
-        elif "resend_api_key not configured" in body:
-            skip("REAL SEND (global key)", "resend_api_key not in settings")
+        reason = real_send_skip_reason()
+        if reason:
+            skip("REAL SEND (global key)", reason)
         else:
-            fail("REAL SEND (global key)", body)
+            r = client.post(f"/admin/campaigns/{camp_id}/launch")
+            body = r.text[:300]
+            if r.status_code == 200 and "error" not in r.text.lower():
+                d = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
+                ok("REAL SEND (global key)", f"dispatched={d.get('dispatched','?')} suppressed={d.get('suppressed','?')}")
+                r2 = client.post(f"/admin/campaigns/{camp_id}/launch")
+                check("re-launch already-dispatched -> error",
+                      r2.status_code != 200 or "error" in r2.text.lower())
+            else:
+                fail("REAL SEND (global key)", body)
 
     # - entity key campaign -
     if co_id and tmpl_id:
@@ -677,20 +694,20 @@ def test_stress(client: httpx.Client) -> None:
     t0 = time.time()
     for _ in range(10):
         client.get("/admin/contacts")
-    check(f"10× GET /admin/contacts in {time.time()-t0:.1f}s", time.time()-t0 < 10)
+    check(f"10\u00D7 GET /admin/contacts in {time.time()-t0:.1f}s", time.time()-t0 < 10)
 
     t0 = time.time()
     for _ in range(10):
         client.get("/admin/entities")
-    check(f"10× GET /admin/entities in {time.time()-t0:.1f}s", time.time()-t0 < 10)
+    check(f"10\u00D7 GET /admin/entities in {time.time()-t0:.1f}s", time.time()-t0 < 10)
 
     # rapid set-key on same company
     if co_ids:
         t0 = time.time()
         for i in range(5):
             client.post(f"/admin/entities/{co_ids[0]}/set-key",
-                        data={"resend_api_key": f"re_stress_key_{i}"})
-        check(f"5× set-key on same company in {time.time()-t0:.1f}s", time.time()-t0 < 3)
+                        json={"resend_api_key": f"re_stress_key_{i}"})
+        check(f"5\u00D7 set-key on same company in {time.time()-t0:.1f}s", time.time()-t0 < 3)
 
     # bulk delete
     t0 = time.time()
@@ -779,12 +796,12 @@ def test_campaign_ops(client: httpx.Client, tmpl_id: int | None, contact_ids: di
 
     # Clone
     r = client.post(f"/admin/campaigns/{base_id}/clone")
-    check("clone campaign -> redirect", r.status_code == 303, f"got {r.status_code}")
+    check("clone campaign -> 200 with id", r.status_code == 200 and isinstance(r.json().get("id"), int), f"got {r.status_code}")
 
     # Pause (requires tested/scheduled/dispatched status - mark tested first)
     client.post(f"/admin/campaigns/{base_id}/mark-tested")
     r = client.post(f"/admin/campaigns/{base_id}/pause")
-    check("pause tested campaign -> redirect", r.status_code == 303, f"got {r.status_code}")
+    check("pause tested campaign -> 200", r.status_code == 200, f"got {r.status_code}")
     r2 = client.get(f"/admin/campaigns/{base_id}")
     camp = r2.json().get("campaign", {})
     check("campaign status is paused", camp.get("status") == "paused",
@@ -792,19 +809,19 @@ def test_campaign_ops(client: httpx.Client, tmpl_id: int | None, contact_ids: di
 
     # Resume
     r = client.post(f"/admin/campaigns/{base_id}/resume")
-    check("resume paused campaign -> redirect", r.status_code == 303, f"got {r.status_code}")
+    check("resume paused campaign -> 200", r.status_code == 200, f"got {r.status_code}")
     r2 = client.get(f"/admin/campaigns/{base_id}")
     camp = r2.json().get("campaign", {})
     check("campaign status is tested after resume", camp.get("status") == "tested",
           f"got {camp.get('status')}")
 
-    # Pause non-existent - UI form handler always redirects (swallows error by design)
+    # Pause non-existent - delegated handler returns the API refusal
     r = client.post("/admin/campaigns/9999999/pause")
-    check("pause non-existent -> redirect", r.status_code == 303, f"got {r.status_code}")
+    check("pause non-existent -> 404", r.status_code == 404, f"got {r.status_code}")
 
-    # Resume non-paused - UI form handler always redirects
+    # Resume non-paused - delegated handler returns the API refusal
     r = client.post(f"/admin/campaigns/{base_id}/resume")
-    check("resume non-paused -> redirect", r.status_code == 303, f"got {r.status_code}")
+    check("resume non-paused -> 400", r.status_code == 400, f"got {r.status_code}")
     # But verify status was not changed
     r2 = client.get(f"/admin/campaigns/{base_id}")
     check("status unchanged after bad resume", r2.json()["campaign"]["status"] == "tested",
@@ -901,7 +918,7 @@ def test_selective_export(client: httpx.Client, tmpl_id: int | None) -> None:
         check("contact export selected -> 200", r3.status_code == 200)
         check("selected export filename", "selected" in r3.headers.get("content-disposition", ""))
         lines = [l for l in r3.text.splitlines() if l.strip() and not l.startswith("email")]
-        check("selected export row count ≤ requested", len(lines) <= len(ids))
+        check("selected export row count \u2264 requested", len(lines) <= len(ids))
 
     # Templates export (all)
     r = client.get("/admin/templates/export")
@@ -1041,10 +1058,10 @@ def test_campaign_edit(client: httpx.Client, tmpl_id: int | None) -> None:
     r5 = client.post("/admin/campaigns/9999999/edit", json={"name": "ghost"})
     check("edit non-existent -> 400", r5.status_code == 400, f"got {r5.status_code}")
 
-    # Archive (requires dispatched/failed/cancelled - mark tested + dispatch first, or just test 303 redirect)
+    # Archive through the delegated JSON handler
     # Dispatched campaign: use the existing one from earlier tests
     r6 = client.post(f"/admin/campaigns/{cid}/archive")
-    check("archive -> redirect", r6.status_code == 303, f"got {r6.status_code}")
+    check("archive -> 200 JSON", r6.status_code == 200 and r6.json() == {"archived": True}, f"got {r6.status_code}")
     r7 = client.get(f"/admin/campaigns/{cid}")
     check("status is archived", r7.json()["campaign"]["status"] == "archived",
           f"got {r7.json()['campaign']['status']}")
@@ -1091,7 +1108,7 @@ def test_tags(client: httpx.Client) -> None:
     check("tags page -> 200", r.status_code == 200, f"got {r.status_code}")
     check("tags page has filter bar",    'id="tag-filter"' in r.text)
     check("tags page has sortable cols", 'sortable' in r.text)
-    check("tags page has kebab menu",    '⋮' in r.text or 'tag-menu' in r.text)
+    check("tags page has kebab menu",    '\u22EE' in r.text or 'tag-menu' in r.text)
     check("tags page has toolbar",       'tag-toolbar' in r.text)
 
     # Seed contacts with tags
@@ -1127,13 +1144,13 @@ def test_tags(client: httpx.Client) -> None:
         check("contacts/json has contacts key", "contacts" in d)
         check("contacts/json returns tagged contacts", d.get("total", 0) == 2)
 
-    # Delete via form (UI form endpoint)
-    r4 = client.post("/admin/tags/delete", data={"tag": "e2e-tag-beta"})
-    check("tag delete form -> redirect", r4.status_code == 303, f"got {r4.status_code}")
+    # Delete via JSON (as the Tags page does)
+    r4 = client.post("/admin/tags/delete", json={"tag": "e2e-tag-beta"})
+    check("tag delete -> 200", r4.status_code == 200, f"got {r4.status_code}")
 
-    # Delete via JSON API (form endpoint shadows JSON at same path - sends form)
-    r4b = client.post("/admin/tags/delete", data={"tag": "e2e-tag-gamma"})
-    check("tag delete form -> redirect", r4b.status_code == 303, f"got {r4b.status_code}")
+    # Delete another tag via the delegated JSON handler
+    r4b = client.post("/admin/tags/delete", json={"tag": "e2e-tag-gamma"})
+    check("tag delete -> 200", r4b.status_code == 200, f"got {r4b.status_code}")
 
     # Rename non-existent -> 0 updated
     r5 = client.post("/admin/tags/rename",
@@ -1252,6 +1269,31 @@ def _cloud_bearer() -> str:
     except Exception:
         pass
     return ""
+
+
+@functools.lru_cache(maxsize=None)
+def real_send_skip_reason(need_cloud: bool = True) -> str | None:
+    """Decided before any endpoint is called. RESEND_API_KEY is checked for presence only."""
+    if not REAL_SEND_ON:
+        return "real send is opt-in: E2E_REAL_SEND is not 1"
+    if not REAL_SEND_TO:
+        return "E2E_REAL_SEND=1 but E2E_REAL_SEND_TO is empty"
+    for a in REAL_SEND_TO:
+        dom = a.rpartition("@")[2]
+        if "@" not in a or any(dom == name or dom.endswith("." + name) for name in REAL_SEND_RESERVED_DOMAINS):
+            return "E2E_REAL_SEND_TO refused: malformed or reserved (RFC 2606/6761) address"
+    if not _os.environ.get("RESEND_API_KEY"):
+        return "E2E_REAL_SEND=1 but RESEND_API_KEY is not set"
+    if need_cloud:
+        cloud = _cloud_client()
+        if cloud is None or not _cloud_bearer():
+            return "no cloud: CLOUD_URL/cloud_url unset or cloud_bearer.txt missing"
+        try:
+            if cloud.get("/healthz").status_code != 200:
+                return "cloud unreachable: /healthz not 200"
+        except Exception:
+            return "cloud unreachable: /healthz did not answer"
+    return "real-send leg deferred: recipients not wired into send sections"
 
 
 def test_rate_limiting(client: httpx.Client) -> None:
@@ -1417,11 +1459,15 @@ def test_relaunch(client: httpx.Client, tmpl_id: int | None,
     # per-day lock (that behaviour is covered separately in test_per_day_lock).
     _clear_e2e_locks()
 
-    # Launch normally (v3.22: batched + deferred)
-    r2 = client.post(f"/admin/campaigns/{cid}/launch")
-    check("initial launch -> 200", r2.status_code == 200, f"got {r2.status_code}")
-    if r2.status_code == 200:
-        check("launch is batched", "batches" in r2.json(), f"got keys {list(r2.json())}")
+    reason = real_send_skip_reason()
+    if reason:
+        skip("initial launch -> 200", reason)
+    else:
+        # Launch normally (v3.22: batched + deferred)
+        r2 = client.post(f"/admin/campaigns/{cid}/launch")
+        check("initial launch -> 200", r2.status_code == 200, f"got {r2.status_code}")
+        if r2.status_code == 200:
+            check("launch is batched", "batches" in r2.json(), f"got keys {list(r2.json())}")
 
     # Retry failed (which internally uses relaunch path)
     r3 = client.post(f"/admin/campaigns/{cid}/retry")
@@ -1455,15 +1501,19 @@ def test_campaign_test_send(client: httpx.Client, tmpl_id: int | None) -> None:
                      json={"to_email": "test@example.com"})
     check("test-send non-existent -> 404", r3.status_code == 404, f"got {r3.status_code}")
 
-    # No key configured - should fail with clear message (global key may or may not be set)
-    r4 = client.post(f"/admin/campaigns/{cid}/test-send",
-                     json={"to_email": TARGET_EMAILS[0]})
-    check("test-send -> handled (200 or 400)", r4.status_code in (200, 400),
-          f"got {r4.status_code}: {r4.text[:80]}")
-    if r4.status_code == 200:
-        d = r4.json()
-        check("test-send response has sent field", "sent" in d)
-        check("test-send response has message_id", "message_id" in d)
+    reason = real_send_skip_reason(need_cloud=False)
+    if reason:
+        skip("test-send -> handled (200 or 400)", reason)
+    else:
+        # No key configured - should fail with clear message (global key may or may not be set)
+        r4 = client.post(f"/admin/campaigns/{cid}/test-send",
+                         json={"to_email": REAL_SEND_TO[0]})
+        check("test-send -> handled (200 or 400)", r4.status_code in (200, 400),
+              f"got {r4.status_code}: {r4.text[:80]}")
+        if r4.status_code == 200:
+            d = r4.json()
+            check("test-send response has sent field", "sent" in d)
+            check("test-send response has message_id", "message_id" in d)
 
 
 def test_test_send_chain_v318(client: httpx.Client, tmpl_id: int | None) -> None:
@@ -1490,60 +1540,6 @@ def test_test_send_chain_v318(client: httpx.Client, tmpl_id: int | None) -> None
         check("chain has unsub_error field", "unsub_error" in d)
 
 
-def test_agent_api(client: httpx.Client, tmpl_id: int | None) -> None:
-    section("AGENT API (v3.21)")
-    import httpx as _httpx
-    base = str(client.base_url)
-    TOKEN = "agt_e2e_token_xyz"
-    # Enable the surface
-    import sys; sys.path.insert(0, "/app")
-    from mailman.terminal import settings as _s
-    _s.set("agent_token", TOKEN)
-
-    raw = _httpx.Client(base_url=base, timeout=15)
-
-    # No token -> 401
-    r = raw.get("/agent/state")
-    check("agent /state no token -> 401", r.status_code == 401, f"got {r.status_code}")
-
-    # Wrong token -> 401
-    r = raw.get("/agent/state", headers={"Authorization": "Bearer wrong"})
-    check("agent /state wrong token -> 401", r.status_code == 401, f"got {r.status_code}")
-
-    h = {"Authorization": f"Bearer {TOKEN}"}
-    r = raw.get("/agent/state", headers=h)
-    check("agent /state -> 200", r.status_code == 200, f"got {r.status_code}")
-    if r.status_code == 200:
-        d = r.json()
-        for k in ("entities", "templates", "contact_total", "suppression_total",
-                  "running_campaigns", "locked_contacts"):
-            check(f"agent /state has {k}", k in d)
-
-    if tmpl_id:
-        r = raw.post("/agent/campaigns/plan", headers=h,
-                     json={"template_id": tmpl_id, "kind": "promotional"})
-        check("agent /plan promotional -> 200", r.status_code == 200, f"got {r.status_code}")
-        promo = r.json() if r.status_code == 200 else {}
-        check("plan is dry_run", promo.get("dry_run") is True)
-        check("plan has sendable", "sendable" in promo)
-
-        r2 = raw.post("/agent/campaigns/plan", headers=h,
-                      json={"template_id": tmpl_id, "kind": "transactional"})
-        trans = r2.json() if r2.status_code == 200 else {}
-        # transactional bypasses promotional-scope unsubs -> suppressed ≤ promotional
-        if promo and trans:
-            check("transactional suppresses ≤ promotional (scope bypass)",
-                  trans.get("suppressed", 0) <= promo.get("suppressed", 0),
-                  f"promo={promo.get('suppressed')} trans={trans.get('suppressed')}")
-
-    # Execute is guarded
-    r = raw.post("/agent/campaigns/execute", headers=h,
-                 json={"template_id": tmpl_id or 1, "name": "e2e-agent"})
-    check("agent /execute guarded -> 501", r.status_code == 501, f"got {r.status_code}")
-
-    raw.close()
-
-
 def test_per_day_lock(client: httpx.Client, tmpl_id: int | None, contact_ids: dict) -> None:
     section("PER-DAY CONTACT LOCK (v3.21)")
     if not tmpl_id or not contact_ids:
@@ -1559,6 +1555,10 @@ def test_per_day_lock(client: httpx.Client, tmpl_id: int | None, contact_ids: di
     aid = a.json()["id"]
     client.post(f"/admin/campaigns/{aid}/recipients", json={"contact_ids": ids})
     client.post(f"/admin/campaigns/{aid}/mark-tested")
+    reason = real_send_skip_reason()
+    if reason:
+        skip("per-day lock launches (A, B)", reason)
+        return
     _clear_e2e_locks()  # clear any earlier collisions first
     ra = client.post(f"/admin/campaigns/{aid}/launch")
     check("lock: campaign A launches", ra.status_code == 200, f"got {ra.status_code}")
@@ -1594,8 +1594,14 @@ def test_batches_and_seeds(client: httpx.Client, tmpl_id: int | None, contact_id
     check("seed add -> 200", rs.status_code == 200, f"got {rs.status_code}")
     check("seeds list has it", any(s["email"] == "seed-e2e@example.com"
           for s in client.get("/admin/seeds").json()["seeds"]))
+    if rs.status_code == 200:
+        client.delete(f"/admin/seeds/{rs.json()['id']}")
+    reason = real_send_skip_reason()
+    if reason:
+        skip("batches/seeds launch", reason)
+        return
 
-    # small batch size so we get ≥2 batches; fresh contacts so none are suppressed
+    # small batch size so we get >=2 batches; fresh contacts so none are suppressed
     client.post("/admin/settings/api", json={"key": "send_batch_size", "value": "1"})
     fresh = []
     for i in (1, 2):
@@ -1619,7 +1625,7 @@ def test_batches_and_seeds(client: httpx.Client, tmpl_id: int | None, contact_id
     check("batch launch -> 200", rl.status_code == 200, f"got {rl.status_code}")
     if rl.status_code == 200:
         j = rl.json()
-        check("≥2 batches created", j.get("batches", 0) >= 2, f"got {j.get('batches')}")
+        check("\u22652 batches created", j.get("batches", 0) >= 2, f"got {j.get('batches')}")
         check("batch 1 deferred to a window", bool(j.get("batch_1", {}).get("window_start")))
 
     rb = client.get(f"/admin/campaigns/{cid}/batches")
@@ -1667,8 +1673,12 @@ def test_sync_pull_unsubs(client: httpx.Client) -> None:
 # main
 
 def main() -> int:
-    print("\n\033[1mep-v3 live e2e tester v3 (entities edition)\033[0m")
-    print(f"target: {BASE}  |  real-send targets: {', '.join(TARGET_EMAILS)}")
+    for name, value in (("E2E_ADMIN", ADMIN), ("E2E_PASSWD", PASSWD)):
+        if not value:
+            print(f"error: {name} is required", file=sys.stderr)
+            return 2
+    print("\n\033[1mMailMan live e2e (3.24)\033[0m")
+    print(f"target: {BASE}")
 
     try:
         r = httpx.get(f"{BASE}/healthz", timeout=5)
@@ -1677,8 +1687,12 @@ def main() -> int:
         print(f"\033[31mCannot reach {BASE}: {e}\033[0m")
         return 1
 
-    has_key = ensure_resend_key()
-    print(f"  resend key: {'✓ available' if has_key else '✗ not found - real send will skip'}")
+    print(f"  E2E_REAL_SEND={'1' if REAL_SEND_ON else 'off'}  |  RESEND_API_KEY={'set' if _os.environ.get('RESEND_API_KEY') else 'unset'}  |  E2E_REAL_SEND_TO={len(REAL_SEND_TO)} address(es)")
+    print(f"  real-send checks: SKIP ({real_send_skip_reason()})")
+    refusal = agent_token_refusal()
+    if refusal:
+        print(f"\033[31mRefusing to run: {refusal}\033[0m")
+        return 2
     cleanup_e2e_data()
 
     try:
@@ -1721,10 +1735,9 @@ def main() -> int:
         test_relaunch(client, tmpl_id, contact_ids)
         test_campaign_test_send(client, tmpl_id)
         test_test_send_chain_v318(client, tmpl_id)
-        # v3.21 consent gating + agent
+        # v3.21 consent gating
         test_per_day_lock(client, tmpl_id, contact_ids)
         test_sync_pull_unsubs(client)
-        test_agent_api(client, tmpl_id)
         # v3.22 batched + windowed sending
         test_batches_and_seeds(client, tmpl_id, contact_ids)
     except Exception:
@@ -1740,7 +1753,7 @@ def main() -> int:
         print("\n\033[31mFailed:\033[0m")
         for r in results:
             if not r.ok:
-                print(f"  ✗ {r.name}  {r.note}")
+                print(f"  \u2717 {r.name}  {r.note}")
     print()
     return 0 if failed == 0 else 1
 
