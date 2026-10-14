@@ -1,204 +1,148 @@
-# Email Platform v3.1 - Cloud-Sync Spinnable Architecture
+# MailMan architecture
 
-**Supersedes:** `email-platform-v3.0-architecture.md` (which described the WG-mediated "spinnable vault" version). v3.1 keeps the spinnable + cache-only-the-irreplaceable spirit but pivots topology: cloud-mediated sync between two local terminals, no WireGuard, no wake-hook.
-
-**Status:** Design locked 2026-05-19. Implementation to follow. This is the contract - every commit on the v3 codebase should be traceable to a section here.
+The package version is 3.24.0 (`src/mailman/__init__.py` and `pyproject.toml`).
 
 ---
 
-## §1 - Topology (load-bearing)
+## Section 1 - Topology
 
 ```
-   OPERATOR LAPTOP                              CLIENT LAPTOP
-   (docker compose)                             (docker compose)
-   ┌──────────────────────────┐                ┌──────────────────────────┐
-   │ Local terminal           │                │ Local terminal           │
-   │ - localhost admin UI     │                │ - localhost admin UI     │
-   │ - SQLite full-cache      │                │ - SQLite full-cache      │
-   │ - encrypted at rest      │                │ - encrypted at rest      │
-   │ - holds K_op_priv        │                │ - holds K_cl_priv        │
-   │ - holds K_cl_priv (copy) │                │ - holds K_op_priv (copy) │
-   │ - holds K_op_pub, K_cl_pub                │ - same                   │
-   │ - one-click full backup  │                │ - one-click full backup  │
-   │ - works offline          │                │ - works offline          │
-   └────────┬─────────────────┘                └──────────┬───────────────┘
-            │                                              │
-            │   HTTPS sync (long-poll, encrypted payloads)│
-            └──────────────┬───────────────────────────────┘
-                           ▼
-                ┌──────────────────────────────────────┐
-                │ CLOUD SERVER (operator-hosted)       │
-                │ - public HTTPS                       │
-                │ - dumb storage + execution loop      │
-                │ - holds K_op_pub, K_cl_pub           │
-                │ - holds K_temp with TTL 1h/24h/7d    │
-                │ - encrypted-at-rest blobs (cannot   │
-                │   decrypt K_op+K_cl payloads)        │
-                │ - can decrypt K_temp payloads        │
-                │   only during TTL                    │
-                │ - public endpoints: /webhooks/resend,│
-                │   /u/<token>, /e/<token>             │
-                │ - sync API: /sync GET (long-poll),   │
-                │   /sync/push POST                    │
-                │ - pack API: /packs POST + dispatcher │
-                │ - 3 Resend API keys (one per sender  │
-                │   domain), encrypted with K_temp     │
-                └──────────────────────────────────────┘
-                           ▲                    ▼
-              Resend webhooks in        Resend POSTs out
-              (HMAC verified;           (per-domain key;
-              encrypted to              microsecond plaintext
-              K_op_pub + K_cl_pub)      window)
+Operator terminal                 Client terminal
+SQLite + own KEM private key      SQLite + own KEM private key
+              |                   |
+              +---- HTTPS --------+
+                        |
+                  ep-api Lambda
+                  (FastAPI + Mangum)
+                        |
+                 DynamoDB + SQS
+                        |
+                 ep-dispatcher Lambda
+                        |
+                     Resend
 ```
 
-**Component count:** 1 cloud server + 2 local terminals = 3 deployed pieces. WireGuard is GONE. Wake-hook is GONE. Backup module is folded INTO each local terminal.
+The API handles sync, handshake, packs, webhooks, compliance and settings.
+The dispatcher handles SQS records and an EventBridge due-pack sweep.
+The terminal runs the admin UI, sync client, materialiser and scheduler.
+
+`docker-compose.yml` runs only the terminal and publishes `8011:8000` without
+restricting the host interface to localhost. The entrypoint binds to `0.0.0.0`.
+WireGuard setup remains in the entrypoint but is skipped when its key variables
+are empty, as they are in the production compose file.
+
+`docker-compose.dev.yml` defines DynamoDB Local, localstack, cloud, dispatcher
+and terminal services. See Known limitations in the README before using it.
 
 ---
 
-## §2 - Encryption key model (the heart of the design)
+## Section 2 - Encryption key model
 
-### §2.1 - Three key materials
+### Section 2.1 - Key material
 
 | Key | Where it lives | What it does |
 |---|---|---|
-| **K_op_priv** | Operator's terminal (primary) + Client's terminal (recovery copy) | Decrypts data encrypted to K_op_pub. Signs as operator. |
-| **K_cl_priv** | Client's terminal (primary) + Operator's terminal (recovery copy) | Decrypts data encrypted to K_cl_pub. Signs as client. |
-| **K_op_pub, K_cl_pub** | Everywhere (operator + client + cloud) | Encrypt-to. Verify signatures. Public, can be on stickers. |
-| **K_temp** | Cloud only; TTL 1h / 24h / 7d, operator picks per launch | Decrypts packs at dispatch time. Wiped on TTL expiry. |
+| **Own KEM private key** | Each terminal's `TERMINAL_KEYS_DIR/own_kem_priv.key` | Decrypts the wrap addressed to that terminal. |
+| **Peer KEM public key** | Each terminal's `TERMINAL_KEYS_DIR/peer_kem_pub.key` | Encrypts the peer's copy of the per-payload key. |
+| **K_op_pub, K_cl_pub** | Registered on the cloud; each terminal has its own and its peer's public key | Wrap per-payload keys for both parties. |
+| **K_temp** | Terminal cache and cloud DynamoDB | Decrypts packs while active; valid TTLs are 1h, 24h and 7d. |
 
-**Recovery model (Reading A - chosen):** each terminal holds BOTH private keys. Trade-off acknowledged: compromise of one PC = full breach (attacker gets both keys at once). Mitigation: the 6-location backup property below makes data-loss require simultaneous compromise of 6 independent stores, but data-disclosure on one-PC-compromise is just accepted.
+`KeyBundle.load()` loads the terminal's own private key and the peer's public
+key. See Known limitations in the README for the handshake helper.
 
-### §2.2 - Two encryption modes
+### Section 2.2 - Two encryption modes
 
-- **`K_op_pub + K_cl_pub` mode** - random per-row ephemeral key encrypts payload; ephemeral key wrapped TWICE (once each pubkey); both wraps travel with the row. Either party can independently decrypt locally. **Cloud CANNOT decrypt.** Used for: contacts, templates, campaigns, suppression, audit log, history, webhook events.
-- **`K_temp` mode** - symmetric AES-256-GCM with K_temp. **Cloud CAN decrypt during TTL.** Used for: packs only.
+- **`K_op_pub + K_cl_pub` mode** - random per-payload AES-256-GCM key, wrapped twice with NaCl SealedBox. Either party decrypts its wrap with its own private key. Used by the cloud for webhook and suppression events.
+- **`K_temp` mode** - symmetric AES-256-GCM with K_temp. The dispatcher decrypts packs with the active key.
 
-### §2.3 - K_temp lifecycle
+### Section 2.3 - K_temp lifecycle
 
-- **First mint (automagic):** first terminal to connect to a fresh cloud detects no active K_temp -> mints one with default 24h TTL -> ships to cloud over an authenticated POST. No human button.
-- **Refresh ("auto sync to current campaign" button):** visible on any campaign-detail page when stuck packs are present. Click triggers: mint new K_temp -> push to cloud -> fetch stuck packs (encrypted with old K_temp from before expiry, undecryptable) -> terminal pulls the source data from its local SQLite -> re-encrypts packs with new K_temp -> pushes back. Either party can click; first-wins.
-- **Expiry:** cloud-side TTL watchdog wipes K_temp on expiry. Pending packs become `status='stuck_no_key'`. Dispatcher refuses to run on stuck packs.
-- **TTL choice:** operator picks at launch. 1h = paranoid (campaign must complete in an hour or get refreshed). 24h = default. 7d = long campaigns / on-vacation tolerance.
+- **Mint:** the launch helper checks its cached key against `/key/temp/status`; if it cannot reuse it, it mints and posts a new key. The default TTL setting is 86400 seconds.
+- **Storage:** `keys_dynamo.py` stores key bytes, expiry metadata and an active-key pointer in DynamoDB. Expired reads delete the active key and return no key.
+- **Dispatch:** a pack with no active key becomes `stuck_no_key`; a decrypt failure becomes `failed`.
+- **TTL setting:** `default_k_temp_ttl_s` is editable on the Overview page. There is no automatic stuck-pack re-encryption flow.
 
-### §2.4 - Crypto stack
+### Section 2.4 - Crypto stack
 
-- **Signing + KEM:** ed25519 + X25519 (32-byte private keys)
-- **Symmetric:** AES-256-GCM (32-byte K_temp)
-- **Library:** libsodium / NaCl primitives (widely audited, fast, no algorithm choices to fuck up)
-- **Envelope (optional aesthetic):** keys can be displayed as 512-char base64 strings in setup output for visible-paranoia. Crypto material is still 32-byte primitives underneath.
+- **KEM:** X25519 via NaCl SealedBox (PyNaCl)
+- **Symmetric:** AES-256-GCM via `cryptography`
 
 ---
 
-## §3 - Sync protocol (the genuinely new build)
+## Section 3 - Sync protocol
 
-### §3.1 - Wire format (every record on the sync wire)
+### Section 3.1 - Sync push record
 
 ```json
 {
-  "table":             "templates|campaigns|contacts|suppression|...",
-  "id":                "<uuid>",
+  "table":             "webhook_event",
+  "id":                "<row-id>",
   "revision":          47,
-  "actor":             "operator|client",
+  "actor":             "operator",
   "modified_at":       "2026-05-19T01:23:45Z",
   "encrypted_payload": "<base64>",
-  "key_id":            "K_op+K_cl" | "K_temp",
+  "key_id":            "K_op+K_cl",
   "deleted":           false
 }
 ```
 
-Cloud stores blob + plaintext metadata (`revision`, `actor`, `modified_at`, `table`, `id`, `key_id`, `deleted`). Cloud sorts/indexes on metadata; cannot read payloads it doesn't have the key for.
+Cloud stores the blob plus plaintext metadata (`revision`, `actor`, `modified_at`, `table_name`, `row_id`, `key_id`, `deleted`). Cloud sorts/indexes on metadata; cannot read payloads it doesn't have the key for.
 
-### §3.2 - Lamport revision math (deterministic last-write-wins)
-
-- Each terminal holds local counter
-- On write: `counter = max(local_counter, max_observed_revision) + 1`
-- On sync receive: `local_counter = max(local_counter, max_received_revision)`
-- Tie-breaker on equal revisions: `operator > client` (lexically deterministic)
-
-Wall clock used **only** for sub-minute conflict-flag UX. Never for ordering.
-
-### §3.3 - Transport (long-poll)
+### Section 3.2 - Transport and cursors
 
 ```
-GET  /sync?since=<event_id>&timeout=30
-  -> returns events with event_id > since immediately if any
-  -> holds up to 30s otherwise; returns [] on timeout
-  -> terminal repeats with new cursor
+GET /sync/pull?since=<integer>&unsub_since=<cursor>
+  -> returns events, max_event_id, unsubs and max_unsub_at immediately
 
 POST /sync/push
   body: [array of sync events]
-  -> cloud validates revisions, assigns event_ids, stores, returns acks
-  -> cloud detects sub-minute conflicts -> writes near_conflict_log row
+  -> stores events and returns assigned_event_ids and near_conflicts
 ```
 
-Long-poll over HTTP/2. No WebSocket, no persistent connections to maintain. Reconnect = re-issue GET.
+DynamoDB allocates integer event IDs with an atomic counter. The terminal stores
+`last_pulled_event_id` in `sync_state` and polls every 5 seconds by default
+(`SYNC_POLL_INTERVAL_S`). Pulled events enter `inbox`; duplicate
+`(table_name, row_id, revision)` entries are skipped. The materialiser applies
+`webhook_event` and `suppression` rows; it does not merge contact, template or
+campaign edits between terminals.
 
-### §3.4 - Cursor / resume
+### Section 3.3 - Conflict flagging
 
-Cloud maintains a global `event_id` sequence (monotonic). Terminal stores `last_synced_event_id` locally. Reconnect = resume. Idempotent - replaying events you've already seen no-ops (local DB has higher revision).
+Cloud flags writes by different actors to the same `(table, row_id)` when their
+`modified_at` timestamps differ by less than 60 seconds. The API exposes
+`GET /sync/near-conflicts` and `POST /sync/near-conflicts/{conflict_id}/ack`.
+It appends events rather than resolving them by a Lamport tie-breaker.
 
-### §3.5 - Conflict flagging (UX-only, doesn't change ordering)
+### Section 3.4 - Tombstones
 
-Near-conflict = two writes to same `(table, id)` whose `modified_at` are within 60s of each other.
-
-Cloud detects on `/sync/push` receipt -> writes to `near_conflict_log`. Both terminals see the flag on next sync. UI surfaces as:
-
-> *"You and [other party] both touched template 'welcome' 47 seconds apart. Last write won (yours). Review to confirm that was intentional."*
-
-Last-write-wins by revision still applies. The flag is advisory and does not
-change ordering.
-
-### §3.6 - Tombstones
-
-Delete = `deleted: true` + new revision. Cloud keeps metadata forever. Optional GC: once both terminals' cursors past tombstone's event_id, cloud may drop `encrypted_payload` (metadata stays).
+Sync events carry a `deleted` flag. No cursor-based tombstone garbage collector
+is implemented.
 
 ---
 
-## §4 - Pack lifecycle (send execution)
+## Section 4 - Pack lifecycle (send execution)
 
-### §4.1 - Launch flow
+### Section 4.1 - Launch flow
 
-```
-[LOCAL TERMINAL - campaign launch click]
-  1. Validate launch gate (template hash + suppression + tested flag)
-  2. Build packs locally (one per recipient, fully rendered HTML+text)
-  3. For each pack:
-       - Encrypt with K_temp (current active)
-       - Include: recipient, subject, html, text, headers,
-         resend_api_key (per-domain), send_at, content_hash
-  4. POST /packs with the batch
-  5. ALSO: write `dispatched_job` records via regular sync (K_op+K_cl encrypted)
-     - so both terminals see the launch in audit
-```
+Launch validates the campaign and template, filters suppression and contact
+locks, and builds rendered packs locally. Normal launch creates ordered batches
+and dispatches batch 1; later batches use manual approval. Pack payloads include
+the recipient, subject, HTML, text, headers and Resend credentials, encrypted
+with K_temp. Contact jobs are recorded locally after the cloud acknowledges
+pushes; retries reuse deterministic IDs for unrecorded contact sends.
 
-### §4.2 - Cloud dispatcher loop
+### Section 4.2 - Cloud dispatcher
 
-```
-LOOP:
-  pack = SELECT * FROM packs
-         WHERE send_at <= now() AND status='pending' AND key_id=<current K_temp id>
-         ORDER BY send_at
-         LIMIT 1 FOR UPDATE SKIP LOCKED
-  if !pack: sleep(0.1s); continue
+Due packs are enqueued immediately; future packs stay pending until the
+EventBridge sweep enqueues them. The dispatcher conditionally claims a pending
+pack, decrypts it with the active K_temp and calls Resend. It then records
+`sent`, `failed` or `unknown` and clears the encrypted payload.
 
-  try:
-    decrypt(pack.encrypted_payload, K_temp)   # plaintext window starts
-    resp = POST resend.com with pack contents
-    plaintext = None                          # plaintext window ends (~ms)
-    if resp.ok:
-        UPDATE pack SET status='sent', resend_message_id=resp.id,
-                       encrypted_payload=NULL, sent_at=now()
-    else:
-        UPDATE pack SET status='failed', failure=resp.error,
-                       encrypted_payload=NULL
-  except DecryptError:
-    # K_temp expired or wrong-key - refuse to retry
-    UPDATE pack SET status='stuck_no_key'
-```
+Network errors and Resend 5xx responses become `unknown` and stop that
+invocation. These packs are not retried. Stale claims also become `unknown`.
+Plaintext is used during the HTTP request.
 
-**Plaintext window:** measurable in milliseconds. The dispatcher claim -> decrypt -> POST -> discard sequence runs synchronously; plaintext is never persisted, never logged, never visible outside the dispatcher's stack frame.
-
-### §4.3 - Webhook receipt (the special case)
+### Section 4.3 - Webhook receipt (the special case)
 
 ```
 POST /webhooks/resend                # public endpoint, HMAC verified
@@ -206,8 +150,8 @@ POST /webhooks/resend                # public endpoint, HMAC verified
   2. Fail-closed if secret unset
   3. Parse event
   4. Encrypt event payload to BOTH K_op_pub AND K_cl_pub
-     (using per-event ephemeral key + dual wrap, per §2.2)
-  5. Write as a sync event (table='events', K_op+K_cl mode)
+     (using per-event ephemeral key + dual wrap, per Section 2.2)
+  5. Write as a sync event (table='webhook_event', K_op+K_cl mode)
   6. Either terminal picks up on next sync
 ```
 
@@ -215,7 +159,7 @@ Webhooks survive past K_temp TTL because they're encrypted with the long-lived p
 
 ---
 
-## §5 - Public endpoints (cloud-side, internet-facing)
+## Section 5 - Public endpoints (cloud-side, internet-facing)
 
 | Endpoint | Purpose | Auth |
 |---|---|---|
@@ -224,220 +168,105 @@ Webhooks survive past K_temp TTL because they're encrypted with the long-lived p
 | `POST /u/<token>` | RFC 8058 one-click POST | HMAC token |
 | `GET /e/<token>` | GDPR erasure landing | HMAC token |
 | `POST /e/<token>` | GDPR erasure POST | HMAC token |
-| `GET /healthz` | bare health check | none |
+| `GET /healthz` | cloud status and counts | none |
 
-Token HMAC verification uses `UNSUB_SECRET` and `ERASURE_SECRET` - both shipped to cloud at init handshake, encrypted with K_temp (rotate when K_temp rotates).
+Token HMAC verification reads `unsub_secret` and `erasure_secret` from cloud settings. The terminal's inline settings save handler attempts to push these values to the cloud; they are not delivered by handshake or encrypted with K_temp.
 
 ---
 
-## §6 - Sync API (cloud-side, terminal-facing, HTTPS + auth)
+## Section 6 - Sync API (cloud-side, terminal-facing, HTTPS + auth)
 
 | Endpoint | Purpose | Auth |
 |---|---|---|
-| `GET /sync?since=N&timeout=30` | long-poll for new events | bearer (per-terminal) |
-| `POST /sync/push` | terminal writes | bearer |
+| `GET /sync/pull?since=N` | short-poll for new events | bearer (per-terminal) |
+| `POST /sync/push` | append terminal events | bearer |
 | `POST /packs` | upload encrypted send-jobs | bearer |
-| `GET /packs/status?since=N` | pull dispatch results | bearer |
-| `POST /key/temp` | terminal provisions new K_temp | bearer + signature |
-| `DELETE /key/temp` | manual revoke (auto on TTL) | bearer + signature |
-| `POST /init/handshake` | one-time setup (registers pubkeys) | bootstrap token |
+| `GET /packs/status?since_id=<cursor>` | pull dispatch results | bearer |
+| `POST /key/temp` | provision or replace K_temp | bearer |
+| `DELETE /key/temp` | revoke K_temp | bearer |
+| `POST /init/handshake` | register a role's public key | bootstrap token |
 
-**Bearer auth:** each terminal holds a long random session token derived from its private key during init. Cloud knows `(K_op_pub, K_cl_pub)` and which bearer maps to which actor. Bearer tokens rotate on K_temp refresh.
+**Bearer auth:** handshake generates a random token with `secrets.token_urlsafe(48)` and stores its SHA-256 hash in DynamoDB. Revoking `/init/handshake/{role}` with the bootstrap token deletes that public key and revokes its sessions. K_temp refresh does not rotate bearer tokens.
 
 ---
 
-## §7 - Init handshake script
+## Section 7 - Init handshake script
 
-`scripts/v3 init-handshake` - interactive script run ONCE, during a one-time screen-share session between operator + client.
+`scripts/_init_handshake.py` generates or reuses the local X25519 keypair,
+registers the public key using `X-Bootstrap-Token`, and saves the issued bearer.
+It prints the local public key, prompts for the peer's public key and compares
+that key with `/pubkeys` when the peer is registered.
 
+Each terminal's `KeyBundle.load()` loads its own private key and the peer's
+public key. See Known limitations in the README for the handshake helper.
+
+---
+
+## Section 8 - Sender configuration
+
+Sender configuration is stored in terminal `entities` rows. Launch uses the
+campaign's entity credentials, or global sender settings when there is no
+entity. Each pack carries its Resend key. There is no `domain` table or
+per-campaign domain rotation strategy in the current schema.
+
+Quick send and campaign Test send post one message from the terminal straight
+to Resend with the sender key, outside the cloud relay and its encryption.
+
+---
+
+## Section 9 - Backup helper
+
+`scripts/_backup.py` snapshots local SQLite and the key directory, optionally
+scans DynamoDB, and records SQS queue counts. It encrypts snapshots with
+AES-256-GCM using a passphrase-derived scrypt key and writes
+`v3-backup-<actor>-<timestamp>.zip` with an integrity manifest.
+
+See Known limitations in the README before using the backup wrapper.
+
+---
+
+## Section 10 - Tests and probes
+
+Run the default suite inside the project's test container:
+
+```bash
+bash scripts/v3 test
 ```
-Operator runs:    scripts/v3 init-handshake --role operator --cloud https://mail.example.com
-Client runs:      scripts/v3 init-handshake --role client   --cloud https://mail.example.com
 
-Both scripts:
-  1. Generate own (K_priv, K_pub) keypair
-  2. Print own K_pub for the other party to paste in
-  3. Wait for other party's K_pub input
-  4. Once both pubkeys exchanged: register with cloud via /init/handshake
-     (cloud receives bootstrap token from first connection, validates pubkeys,
-     issues bearer tokens for both)
-  5. Operator's terminal: receives K_cl_priv from client (out-of-band, via the
-     screen-share - operator pastes client's exported private key into operator's
-     terminal, and vice versa). Per Reading A - each terminal holds both keys.
-  6. Both terminals fire one-click backup IMMEDIATELY
-     -> both PCs have full snapshot of post-handshake state
-  7. Each terminal additionally exports an offline backup file
-     -> goes to 2 physical media (USB, encrypted external drive, etc.)
-  8. Total backup locations after init: 6 (2 PC mirrors + 2 offline media + cloud + remote)
-```
+The October 2026 baseline is 645 passed, 1 skipped. AWS and Resend are mocked;
+the real-send path has not been run against Resend for this release.
 
-**Why 6 locations:** "data only lost if 2 offline backups + 2 PC backups + clients + server all compromised simultaneously."
+- `tests/test_sync_protocol.py` covers push/pull, auth and near-conflicts.
+- `tests/test_keys_lifecycle.py` covers K_temp TTL and key endpoints.
+- `tests/test_encryption.py` covers round-trips and tamper detection.
+- `tests/test_dispatcher.py` covers mocked dispatcher sends.
+- `tests/test_webhook.py` covers signature verification and encrypted events.
+- `tests/test_pack_push_retry.py` includes long seeded send-path walks.
+- `tests/test_archive_send.py` includes archive/cancel walks.
+- `tests/live_e2e.py` is a separate attended demo script; see `docs/LIVE-E2E.md`.
+
+Probe scripts exist under `scripts/_probe/`; see Known limitations in the README
+for the wrapper's `probe` verb.
 
 ---
 
-## §8 - Multi-domain support (3 sender domains)
+## Section 11 - Trade-offs
 
-- Each sender domain = one row in vault's `domain` table (already supported in schema)
-- Each domain has its own `resend_api_key_id` pointer
-- Each domain has its own `webhook_secret` (Resend issues per webhook config)
-- Packs include the Resend key for the sending domain (so dispatcher picks right key without needing config lookup at send time)
-- Operator picks rotation strategy per campaign: `round_robin` / `lru` / `fixed_per_campaign`
-
-**Currently:** client has 2 domains, third TBD. Platform runs on 2 gracefully; adding 3rd is just a new `domain` row + DNS records + Resend verification.
+- **Cloud holds K_temp during TTL** - compromise during that period exposes pack payloads decryptable with the active key.
+- **Own private keys** - each terminal decrypts its addressed wrap; see Known limitations in the README for the handshake helper.
+- **Sync scope** - incoming webhook and suppression events are materialised; general cross-terminal contact/template/campaign merging is not implemented.
+- **Deployment scope** - the default configuration uses one DynamoDB table; deployment helpers use fixed Lambda names.
 
 ---
 
-## §9 - One-click backup model
-
-Each local terminal exposes a `scripts/v3 backup` verb that produces:
-
-1. Encrypted snapshot of local SQLite (AES-256-GCM with operator-chosen passphrase)
-2. Git snapshot of the local repo state (`git bundle create`)
-3. Combined zip with versioned filename: `v3-backup-<terminal-id>-<timestamp>.zip`
-
-**6-location target after setup:**
-
-| # | Location | Refresh trigger |
-|---|---|---|
-| 1 | Operator PC local SQLite | every sync |
-| 2 | Client PC local SQLite | every sync |
-| 3 | Cloud server encrypted blobs | every sync |
-| 4 | Operator PC backup zip | scripts/v3 backup |
-| 5 | Client PC backup zip | scripts/v3 backup |
-| 6 | Offline media (USB drive at $somewhere) | weekly manual |
-
-Data loss requires simultaneous compromise of all 6.
-
----
-
-## §10 - Edge-case test + stress harness
-
-**These ship alongside the implementation. Not optional.**
-
-### §10.1 - Sync edge cases
-
-- `tests/sync/test_offline_reconnect.py` - terminal disconnects, makes edits, reconnects, verify all writes propagate
-- `tests/sync/test_simultaneous_writes.py` - both terminals edit same row within 60s, verify last-write-wins by revision + near_conflict_log entry
-- `tests/sync/test_resume_from_cursor.py` - kill terminal mid-pull, restart, verify resume from correct event_id
-- `tests/sync/test_lamport_clock.py` - verify revision counters advance correctly under concurrent writes
-- `tests/sync/test_tombstone_propagation.py` - delete on terminal A, verify terminal B sees deletion
-
-### §10.2 - K_temp lifecycle
-
-- `tests/keys/test_auto_mint_on_first_connect.py` - fresh cloud, terminal connects, K_temp auto-created
-- `tests/keys/test_ttl_expiry.py` - fast-forward time past TTL, verify cloud wipes K_temp + stuck packs flagged
-- `tests/keys/test_refresh_during_active_send.py` - refresh K_temp mid-campaign, verify stuck packs re-encrypted + resumed
-- `tests/keys/test_decrypt_with_wrong_key.py` - pack encrypted with old K_temp, dispatcher fails closed
-
-### §10.3 - Pack lifecycle
-
-- `tests/packs/test_dispatcher_microsecond_window.py` - instrument dispatcher, verify plaintext lives <10ms
-- `tests/packs/test_cloud_restart_with_inflight.py` - kill cloud mid-dispatch, restart, verify claimed->pending reset
-- `tests/packs/test_resend_5xx_retry.py` - mock Resend 5xx, verify pack stays pending + retries
-- `tests/packs/test_resend_4xx_no_retry.py` - mock Resend 4xx, verify pack marked failed + no retry
-- `tests/packs/test_decrypt_failure_handling.py` - corrupted pack, verify dispatcher logs + moves on
-
-### §10.4 - Webhook edge cases
-
-- `tests/webhooks/test_hmac_rejection.py` - unsigned webhook -> 401
-- `tests/webhooks/test_replay_window.py` - old timestamp -> 400
-- `tests/webhooks/test_dual_pubkey_encryption.py` - verify event encrypted to both K_op_pub + K_cl_pub
-- `tests/webhooks/test_webhook_during_both_offline.py` - webhook arrives while both terminals offline, terminals sync later, both can decrypt
-
-### §10.5 - Adversarial probes (the "stressers")
-
-- `bin/_probe/inject_unsigned_event.sh` - push a sync event with bad signature -> cloud rejects
-- `bin/_probe/inject_pack_with_no_key.sh` - push pack referencing non-existent K_temp -> dispatcher catches
-- `bin/_probe/replay_old_revision.sh` - push event with revision < current -> no-op (idempotent)
-- `bin/_probe/poison_pubkey.sh` - attempt to register a different K_op_pub mid-session -> cloud rejects (handshake is one-shot)
-- `bin/_probe/exfil_attempt.sh` - simulate compromised cloud, attempt to read K_op+K_cl encrypted payloads -> cryptographic failure
-- `bin/_probe/sync_flood.sh` - terminal pushes 10K writes per second -> cloud handles or rate-limits cleanly
-
----
-
-## §11 - What's removed from v3.0
-
-| Component | Status in v3.1 |
-|---|---|
-| WireGuard tunnels (wg1, wg2) | **REMOVED** - sync over HTTPS instead |
-| wake-hook service | **REMOVED** - cloud always on; terminals user-toggled via `docker compose up` |
-| backup module (separate host) | **REMOVED** - folded into each local terminal's `scripts/v3 backup` |
-| vault -> admin UI | **MOVED** to local terminal; admin UI runs on localhost only |
-| front-edge (always-on, public) | **MERGED** into cloud server |
-| Three-container topology per deploy | **REPLACED** by 1 cloud + 2 local terminals |
-
-## §12 - What's reused from v3.0 codebase
-
-- `vault/app/db.py` -> becomes `terminal/app/db.py` (same schema)
-- `vault/app/routes_admin.py` -> becomes `terminal/app/routes_admin.py` (same CRUD)
-- `vault/app/admin_ui.py` -> becomes `terminal/app/admin_ui.py` (same HTML)
-- `vault/app/auth.py` -> becomes `terminal/app/auth.py` (per-party adaptation)
-- `vault/app/launch.py` -> becomes `terminal/app/launch.py` (now builds packs locally + encrypts + pushes to cloud)
-- `front-edge/app/webhook_receiver.py` -> moves to `cloud/app/webhook_receiver.py`
-- `front-edge/app/compliance_public.py` -> moves to `cloud/app/compliance_public.py`
-- `front-edge/app/compliance_tokens.py` -> moves to `cloud/app/compliance_tokens.py`
-- `front-edge/app/queue_worker.py` -> becomes `cloud/app/dispatcher.py` (with K_temp decrypt)
-
-**New code needed:**
-- `cloud/app/sync.py` - sync endpoints
-- `cloud/app/keys.py` - K_temp lifecycle + bearer issuance
-- `terminal/app/sync_client.py` - long-poll loop + conflict reconciliation
-- `terminal/app/encryption.py` - K_op+K_cl mode + K_temp mode
-- `terminal/app/backup.py` - one-click backup zipper
-- `scripts/v3 init-handshake` - interactive setup script
-- All of `tests/`
-
----
-
-## §13 - Implementation order (don't deviate)
-
-1. **Spec lock** (this doc) -> commit
-2. **Refactor scaffold** - rename `vault/` -> `terminal/`, remove `wake-hook/`, fold `backup/` into terminal, rename `front-edge/` -> `cloud/`
-3. **Encryption layer** - `terminal/app/encryption.py` (two modes) + `cloud/app/keys.py` (K_temp)
-4. **Sync protocol** - `cloud/app/sync.py` endpoints + `terminal/app/sync_client.py` long-poll loop
-5. **Pack lifecycle** - refactor launch to build+push, refactor dispatcher to decrypt+POST
-6. **Webhook receiver** - adapt to encrypt-to-both-pubkeys before sync
-7. **Init handshake** - `scripts/v3 init-handshake` interactive script
-8. **One-click backup** - `scripts/v3 backup` verb
-9. **All tests per §10** - written alongside each piece, not at the end
-10. **Stress probes per §10.5** - same
-
-**Discipline:** every commit references its §-section in the message (e.g. `feat(cloud/sync): GET /sync long-poll per §3.3`). Drift becomes visible in git log.
-
----
-
-## §14 - Acknowledged trade-offs (operator decisions)
-
-- **Each terminal holds both private keys** (Reading A) - one-PC compromise = full breach. Mitigated by 6-location backup against data LOSS; not against data DISCLOSURE.
-- **Cloud holds K_temp during TTL** - cloud compromise during TTL = read everything K_temp can decrypt. TTL choice scales blast radius.
-- **Last-write-wins by Lamport revision** - occasional data loss when both parties edit the same row at once. Acceptable
-  because the two operators coordinate directly.
-- **Single hardened cloud server** - single point of failure if attackers want sending capability + key access. Mitigated by short TTL choices + audit log + the dispatcher's microsecond plaintext window.
-- **No multi-tenant** - one cloud server per engagement. If a second client surfaces, deploy a second cloud server, no shared state.
-
----
-
-**Origin:** Pivoted from v3.0 (WG-mediated, all-local) during the 2026-05-19 client call. Client wants minimum-touch operations on their side; pivots to operator-hosted cloud + two local terminals. Folds in 3-sender-domain rotation, hybrid key model, sync layer, and the testers/stressers harness operator emphasized.
+v3.2 moved the cloud side to Lambda and DynamoDB so that each party runs only a terminal.
 
 
-## §15 - Settings model (Q1 refactor, shipped in v3.1)
+## Section 12 - Settings model
 
-### Why
-
-Phase A of Q1: move operator-facing config from `.env` files into a DB-backed
-`settings` table so admins can edit via UI rather than env-edit + restart.
-
-### Schema (cloud + terminal, identical)
-
-```sql
-CREATE TABLE settings (
-  key         TEXT    PRIMARY KEY,
-  value       TEXT    NOT NULL,        -- plaintext OR base64(AES-256-GCM-encrypted) if is_secret=1
-  is_secret   INTEGER NOT NULL DEFAULT 0,
-  updated_at  TEXT    NOT NULL DEFAULT (datetime('now')),
-  updated_by  TEXT    NOT NULL DEFAULT 'system'
-);
-```
+Terminal settings use the SQLite `settings` table. Cloud settings use DynamoDB
+items with `pk='SETTINGS'` and `sk=<key>`. Both store the value, secret flag,
+update time and updater.
 
 ### Encryption at rest
 
@@ -447,75 +276,66 @@ using a per-side KEK:
 - Cloud: `CLOUD_KEYS_DIR/settings_kek.bin` (0600)
 - Terminal: `TERMINAL_KEYS_DIR/settings_kek.bin` (0600)
 
-KEK is auto-generated on first `migrate_from_env()` call; 32 random bytes.
-Backed up alongside KEM keys via `scripts/v3 backup`. If KEK is lost, encrypted
-settings are unrecoverable (operator must re-set via UI).
+The KEK is loaded or generated when settings encryption is first used and is
+also initialised by `migrate_from_env()`. It contains 32 random bytes. Losing it
+prevents decryption of existing secret settings.
 
-**Decrypted only on read.** No long-lived plaintext cache; secrets re-decrypt
-on every `settings.get()` call. Non-secrets cached in-process for cheap reads.
+Secrets decrypt on each `settings.get()` call. Cloud non-secrets are cached;
+terminal `get()` queries SQLite, while `get_all()` uses a non-secret cache.
 
 ### Secret keys
 
 - **Cloud:** `resend_webhook_secret`, `unsub_secret`, `erasure_secret`
 - **Terminal:** `admin_password_hash`, `jwt_secret`, `unsub_secret`, `erasure_secret`, `resend_api_key`
 
-`admin_password_hash` is already bcrypt'd but still encrypted at rest for
-defense-in-depth (an attacker who reads SQLite can't even brute the bcrypt).
+The settings copy of `admin_password_hash` is bcrypt'd and encrypted. Login
+also reads bcrypt hashes directly from the `operators` table.
 
 ### env-only (by necessity)
 
 - `BOOTSTRAP_TOKEN` (cloud) - chicken-egg with handshake auth
-- `CLOUD_URL`, `CLOUD_BEARER`, `TERMINAL_ACTOR` (terminal) - runtime location
-- `*_DB_PATH`, `*_KEYS_DIR` - filesystem locations
-- `LOG_LEVEL`, `DISABLE_DISPATCHER`, `DISABLE_QUEUE_WORKER` - boot/debug flags
-- `DB_ENCRYPTION_KEY` - backup-only, prompt-driven via `scripts/v3 backup`
+- `CLOUD_URL`, `CLOUD_BEARER`, `TERMINAL_ACTOR` (terminal) - cloud location, bearer and role
+- `VAULT_DB_PATH`, `CLOUD_KEYS_DIR`, `TERMINAL_KEYS_DIR` - filesystem locations
+- `LOG_LEVEL` - logging level
+- `AWS_REGION`, `AWS_DEFAULT_REGION`, `DYNAMODB_TABLE`, `DYNAMODB_ENDPOINT`, `SQS_QUEUE_URL`, `SQS_ENDPOINT` - cloud infrastructure
 
 ### Boot-time migration
 
-Both `main.py` startup hooks call `settings.migrate_from_env()` which copies
-known env vars into the settings table on first boot. Idempotent - if a key
-is already in DB, env is shadowed and logged as "safe to remove".
-
-This means existing v3.0 deployments transparently migrate to v3.1 without
-operator action. Once they verify the UI shows the values, they can delete
-their `.env` entries.
+The terminal startup calls `db.init()`, migrates legacy admin credentials into
+`operators` when that table is empty, then calls `settings.migrate_from_env()`.
+Cloud startup calls `dynamo.init()` and `settings.migrate_from_env()`, but the
+Lambda Mangum handler has `lifespan='off'`, so it does not run that startup hook.
+Existing settings rows are not overwritten by env migration.
 
 ### Admin UI panels
 
-- `/admin/settings/brand` - company_name, support_email, public_host,
-  email_footer_address, email_from
-- `/admin/settings/auth` - admin_email, change password, rotate JWT
-- `/admin/settings/webhooks` - points to Cloud tab for Resend webhook secret
-- `/admin/settings/secrets` - unsub/erasure HMAC secrets + RESEND_API_KEY
-  with reveal-on-click (audit-logged)
-- `/admin/settings/tuning` - TTLs + session lifetime
-- `/admin/settings/cloud` - cross-call to cloud's `/settings` via bearer
-  (operator's terminal can see + edit cloud's settings)
+- `/admin` - K_temp TTL
+- `/admin/entities` - brand, global sender, Resend API key and cloud settings forms
+- `/admin/operators` - session lifetime, password change and JWT rotation
+- `/admin/suppression` - unsub/erasure secrets and token TTLs
+- `/admin/settings/sending` - send window, pacing and batch size
+- `send_daily_cap` - read from settings; configurable through `/admin/settings/api`
+
+Old `/admin/settings/*` pages redirect to these feature pages.
+`/admin/settings/reveal/{key}` reveals a terminal secret and logs the access.
 
 ### REST API
 
 Both sides expose CRUD endpoints:
 
-- Cloud: `/settings*` - bearer auth (terminal calls these from the Cloud UI tab)
+- Cloud: `/settings` and its key/reveal routes - bearer auth (the terminal reads these for the cloud forms)
 - Terminal: `/admin/settings/api/*` - session-cookie auth
 
-Both: list (secrets redacted), single-read, reveal (audit-logged), upsert, delete.
+Both expose list (secrets redacted), single-read, reveal (logged), upsert and delete.
 
-### Cross-side secret sync (Phase C)
+### Cross-side secret sync
 
-Keys in `CROSS_SIDE_SYNC = {unsub_secret, erasure_secret}` auto-push to cloud
-when saved on terminal. HMAC verification on both sides stays in lockstep
-without manual double-entry.
-
-Limitations:
-- Operator-driven push only; cloud->terminal auto-pull on the other terminal
-  is a future enhancement (would use the event_log mechanism with K_op+K_cl
-  encryption).
-- If a secret is set ONLY via cloud's `/settings` API, the terminal won't
-  auto-pull. Operator should always set shared secrets from terminal first.
+The inline terminal save handler attempts to POST `unsub_secret` and
+`erasure_secret` to cloud `/settings` using the stored bearer. A failure leaves
+the local value saved and is logged. Generic `/admin/settings/api` writes do
+not invoke this push. There is no cloud-to-terminal settings auto-pull.
 
 ### Tests
 
-`tests/test_settings.py` - 13 tests covering KEK lifecycle, encryption at rest,
-tamper detection, migration idempotency, env-fallback transitional behavior.
-All 61 tests pass.
+`tests/test_settings.py` has 13 test functions covering KEK lifecycle,
+encryption at rest, tamper detection, migration idempotency and env fallback.

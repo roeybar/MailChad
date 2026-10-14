@@ -1,9 +1,9 @@
-# Client Deployment Guide - $0 cloud infrastructure
+# Client deployment guide
 
-As of v3.2 the cloud runs on **AWS Lambda + DynamoDB** instead of a Docker
-container. The operator deploys the Lambda once; you (the client) just run
-the terminal on your laptop pointed at the API Gateway URL the operator gives
-you. No server to host, no Cloudflare Tunnel, no open ports.
+The production compose file runs a terminal connected to a cloud API via
+`CLOUD_URL`. Cloud code supports an HTTP API Lambda and a dispatcher Lambda.
+The terminal does not host those Lambdas. Its compose port mapping is
+`8011:8000` without a localhost-only host binding.
 
 ---
 
@@ -14,45 +14,33 @@ you. No server to host, no Cloudflare Tunnel, no open ports.
   channel):
   - `CLOUD_URL` - the API Gateway URL, e.g.
     `https://<id>.execute-api.us-east-1.amazonaws.com`
-  - `BOOTSTRAP_TOKEN` - one-time token used during handshake only
+  - `BOOTSTRAP_TOKEN` - cloud token for registration and role revocation
 
-That's it. No AWS account, no DNS, no VPS.
+First-boot login also needs `ADMIN_EMAIL`, `ADMIN_PASSWORD_HASH` and `JWT_SECRET`.
 
 ---
 
 ## One-time setup
 
-### 1. Install Docker
+### 1. Prepare Docker and the checkout
 
-Linux: `curl -fsSL https://get.docker.com | sudo sh`
-Mac: install Docker Desktop
-Windows: Docker Desktop with WSL2
-
-Verify: `docker --version`
-
-### 2. Clone the platform
+The wrapper uses Docker Compose for the terminal.
 
 ```bash
-git clone <repo-url-from-operator>
-cd email-platform-v3
+git clone <repo-url-from-operator> email-platform
+cd email-platform
 ```
 
-### 3. Create your .env
+### 2. Create your .env
 
-```bash
-cat > .env <<EOF
-BOOTSTRAP_TOKEN=<paste from operator>
-TERMINAL_ACTOR=client
-CLOUD_URL=<paste API Gateway URL from operator>
-LOG_LEVEL=INFO
-EOF
-chmod 600 .env
-```
+Copy `.env.example` to `.env`, then set `TERMINAL_ACTOR=client` and the cloud's
+`CLOUD_URL`. Set `ADMIN_EMAIL`, a bcrypt `ADMIN_PASSWORD_HASH` and a random
+`JWT_SECRET` for initial login. Password-hash helper: `scripts/v3 admin-bcrypt`
+(see Known limitations in the README). The handshake requires the cloud's `BOOTSTRAP_TOKEN`.
+The terminal startup migrates known env settings without overwriting existing
+settings rows.
 
-`CLOUD_URL` is the only difference from the operator's `.env` - it points
-at the Lambda the operator already deployed.
-
-### 4. Start your terminal
+### 3. Start your terminal
 
 ```bash
 scripts/v3 up-terminal
@@ -61,77 +49,72 @@ scripts/v3 up-terminal
 Your admin UI is now at `http://localhost:8011`. The cloud is Lambda; you
 are not running the cloud container at all.
 
-### 5. Run the handshake (screen-share with the operator)
+### 4. Run the handshake (screen-share with the operator)
 
-Coordinate a 10-minute call. During the call, run:
+Handshake helper: `scripts/v3 init-handshake --role client --cloud <CLOUD_URL> --bootstrap-token <BOOTSTRAP_TOKEN>`
+(see Known limitations in the README). The helper is `scripts/_init_handshake.py`.
 
-```bash
-scripts/v3 init-handshake \
-  --role client \
-  --cloud <CLOUD_URL> \
-  --bootstrap-token <BOOTSTRAP_TOKEN>
-```
+That helper generates or reuses the local X25519 keypair, registers the public
+key and saves the cloud bearer. It prints the local public key, prompts for
+the peer's public key and checks it against `/pubkeys` when registered.
+The terminal's key loader uses its own private key and the peer's public key.
 
-The script will:
-- Generate your X25519 keypair and store it locally
-- Register your public key with the cloud Lambda
-- Give you a bearer token - stored automatically, no action needed
-- Print your public key for the operator to copy
-- Prompt you to paste the operator's public key
+The sync module loads its bearer at import time, so a newly saved bearer needs
+a terminal process restart before the running sync loops use it.
 
-Both parties end the call with each other's pubkeys registered. The terminal
-sync client will start pulling events from the cloud immediately after.
+### 5. Backup helper
 
-### 6. Backup immediately
+See Known limitations in the README before using the wrapper:
 
 ```bash
 scripts/v3 backup
 ```
 
-Copy the zip to two separate places (USB drive, cloud storage, etc). The zip
-contains your encryption keys. Per the architecture, data is only lost if
-ALL backups AND the cloud are wiped simultaneously.
+`scripts/_backup.py` encrypts snapshots of SQLite and the key directory and can
+include a DynamoDB scan.
 
-### 7. Configure your terminal via the admin UI
+### 6. Configure your terminal via the admin UI
 
 Open `http://localhost:8011/admin/auth/login`.
 
-Settings -> fill in:
-- **Brand** - your company name, support email, postal address (CAN-SPAM),
-  and public hostname (the operator's API Gateway domain)
-- **Auth** - set a strong admin password
+Inline configuration lives on the feature pages:
+- **Entities** - brand, support email, postal address, public host and sender
+- **Operators** - password change, session TTL and JWT rotation
+- **Suppression** - unsubscribe/erasure secrets and token TTLs
+- **Overview** - K_temp TTL
+- **Sending** - window, pacing and batch size
 
-The operator handles cloud-side settings (Resend, webhook secret, etc) from
-their terminal.
+Set required cloud values through cloud `/settings` or its supported environment
+configuration. See Known limitations in the README for the Entities cloud settings form.
 
 ---
 
 ## Day-to-day operation
 
-- Open your laptop -> terminal is already running (it restarts automatically
-  via Docker's `restart: unless-stopped`).
+- The terminal compose service uses `restart: unless-stopped`.
 - Sync is automatic - your terminal polls the Lambda every 5 seconds.
-- You can edit contacts, templates, and campaigns from your admin UI.
-- The operator can do the same from theirs - last-write-wins per field;
-  near-conflicts flagged for review.
-- Sends are dispatched by the Lambda dispatcher - no action needed on your end.
+- You can edit contacts, templates and campaigns locally.
+- Incoming `webhook_event` and `suppression` rows are materialised; general
+  contact/template/campaign edits are not merged between terminals.
+- The cloud dispatcher processes packs already uploaded by the terminal.
 
 If you need to restart: `scripts/v3 down && scripts/v3 up-terminal`
 
 ---
 
-## What the operator set up on their end
+## Cloud setup helpers
 
 For reference (you don't need to do any of this):
 
-1. Created an AWS account + IAM user with the policies in `deploy/iam/`
-2. Ran `scripts/v3 setup-tables` to create the DynamoDB table + SQS queue
-3. Ran `scripts/v3 deploy-api` -> API Gateway URL pointing at the ep-api Lambda
-4. Ran `scripts/v3 deploy-dispatcher` -> ep-dispatcher Lambda triggered by SQS
-5. Set `BOOTSTRAP_TOKEN` as a Lambda environment variable before your handshake
+1. `deploy/setup_tables.py` creates the DynamoDB table, SQS queue and DLQ.
+2. `deploy/deploy_lambda.py` creates or updates the API and dispatcher Lambdas.
+   The API helper prints a next step to configure API Gateway; it does not
+   create the gateway or return its URL.
+3. First dispatcher creation wires SQS; each deployment asserts the sweep schedule.
+4. The cloud handshake reads `BOOTSTRAP_TOKEN` from its environment. Webhook
+   verification requires `resend_webhook_secret` or `RESEND_WEBHOOK_SECRET`.
 
-After the handshake, BOOTSTRAP_TOKEN has served its purpose - the operator
-can remove it from the Lambda env if they want.
+See Known limitations in the README before using the wrapper's deploy helpers.
 
 ---
 
@@ -147,31 +130,18 @@ They can check the Lambda logs with `scripts/v3 tail-api` / `scripts/v3 tail-dis
 
 ---
 
-## Cost breakdown
+## Infrastructure
 
-| Item | Cost |
-|---|---|
-| AWS Lambda (ep-api + ep-dispatcher) | $0 - free tier covers <1M invocations/mo |
-| AWS DynamoDB | $0 - free tier covers <25 RCU/WCU, always |
-| AWS SQS | $0 - free tier covers 1M messages/mo, always |
-| AWS API Gateway HTTP | $0 first 12 months; $0.01/mo after (at 10K req/mo) |
-| Terminal (your laptop, Docker) | $0 marginal |
-| Resend (≤3,000 emails/mo) | $0 |
-| Resend Pro (50K/mo) | $20/mo |
-| **Platform total at 3K send** | **$0/mo** |
-| **Platform total at 50K send** | **~$20/mo** |
-
-No VPS. No Cloudflare subscription. No DNS bill.
+The production terminal uses a Docker named volume for SQLite and local keys.
+Cloud persistence uses DynamoDB; due packs use SQS. No always-on cloud server is
+required for the Lambda code path.
 
 ---
 
 ## If you decide later to hand things back to the operator
 
-Nothing is locked in. If you want to stop running even the terminal:
-
-1. Do one final `scripts/v3 backup` and send it to the operator.
-2. `scripts/v3 down`
-3. The operator can revoke your bearer from their terminal.
-
-Your contact data lives in DynamoDB (operator's AWS account) and in your
-local terminal DB. The operator already has a full copy via sync.
+Cloud `DELETE /init/handshake/{role}` revokes that role's public key and bearer
+sessions and requires `X-Bootstrap-Token`. There is no terminal UI revoke flow.
+Stopping a terminal does not cancel packs already uploaded to the cloud.
+General contact/template/campaign edits are not materialised on the other
+terminal, so do not assume it has a full copy.

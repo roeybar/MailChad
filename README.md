@@ -1,20 +1,17 @@
-# MailMan - email campaigns the server can't read
+# MailMan - email campaigns from your own machine, relayed encrypted
 
-MailMan sends email campaigns without the relay in the middle ever being able
-to read them. You run a small admin app on your own machine, and that's where
-your contacts, templates and encryption keys stay. When you launch a campaign
-your machine encrypts every message before handing it to a cloud relay, which
-passes it on to the email provider and immediately discards it - so even if the
-relay is fully compromised, an attacker gets neither your mail nor your contact
-list. It also paces sending to stay inside provider limits, honours
-unsubscribes and bounces automatically, and runs on AWS's free tier for roughly
-nothing.
+MailMan prepares campaigns in a terminal app with local contacts, templates
+and encryption keys. The terminal encrypts rendered send jobs before handing
+them to the cloud. The cloud dispatcher decrypts those jobs with a temporary
+key to call Resend, then clears the stored encrypted payload on finalisation.
+Webhook and suppression events are encrypted to both terminals' public keys.
+The terminal schedules batches, applies suppression and controls approvals.
 
 ![MailMan admin UI](docs/img/login.png)
 
 [![CI](https://github.com/roeybar/MailMan/actions/workflows/ci.yml/badge.svg)](https://github.com/roeybar/MailMan/actions/workflows/ci.yml)
 
-**Status:** v3.23 - 145/145 pytest, end-to-end verified. Deployable on AWS free tier.
+**Status:** package version 3.24.0. October 2026 test baseline: 645 passed, 1 skipped; AWS and Resend are mocked. The real-send path has not been run against Resend for this release. The admin UI is branded v4; package, API and storage identifiers stay on the v3 line.
 
 **Spec:** [`docs/lambda-dynamo-spec.md`](docs/lambda-dynamo-spec.md)
 
@@ -24,19 +21,22 @@ nothing.
 
 ## What this is
 
-Email platform with strict security separation across two process types:
+Email platform with strict security separation across three components:
 
-- **ep-api Lambda** - always-on, public-facing (API Gateway -> Lambda).
-  Handles sync, handshake, packs push, webhook, compliance endpoints.
-  Holds K_op_pub + K_cl_pub + K_temp (TTL-bounded). Cannot decrypt K_op+K_cl payloads.
-- **ep-dispatcher Lambda** - SQS-triggered, on-demand. Decrypts packs with
-  K_temp, POSTs to Resend, discards plaintext. Warms/cools independently of ep-api.
-- **terminal** - one per party (operator + client), runs on a laptop.
-  Localhost-only admin UI. Holds full local DB cache + KEM private keys.
-  Syncs to cloud via short-poll (5s interval).
+- **ep-api Lambda** - public HTTP API (API Gateway -> Lambda).
+  Handles sync, handshake, packs push, webhook, compliance and settings.
+  Stores public keys and TTL-bounded K_temp in DynamoDB.
+- **ep-dispatcher Lambda** - SQS-triggered, with an EventBridge due-pack sweep.
+  Decrypts packs with K_temp, calls Resend and records dispatch outcomes.
+- **terminal** - local admin UI, SQLite state and its own KEM private key.
+  The compose port mapping publishes `8011:8000` on all host interfaces.
+  Pulls cloud events every 5 seconds by default.
+  Quick send and campaign Test send post one message from the terminal
+  straight to Resend, outside the cloud relay and its encryption; Quick send
+  does not check suppression.
 
-Storage: **DynamoDB single-table** (all entities) + **SQS** (send queue).
-No always-on VPS required. Infra cost is $0 at low volume on AWS free tier.
+Cloud storage: **DynamoDB single-table** + **SQS** (due-pack queue).
+The Lambda code path requires no always-on VPS.
 
 ---
 
@@ -45,37 +45,40 @@ No always-on VPS required. Infra cost is $0 at low volume on AWS free tier.
 ```bash
 # 1. Create .env
 cp .env.example .env
-# Edit: set BOOTSTRAP_TOKEN to any long random string
+# Edit: cloud BOOTSTRAP_TOKEN; terminal ADMIN_EMAIL, ADMIN_PASSWORD_HASH,
+# JWT_SECRET, TERMINAL_ACTOR and CLOUD_URL
 
-# 2. Boot everything locally (DynamoDB Local + localstack SQS + cloud + dispatcher + terminal)
-scripts/v3 up
+# 2. Request the full local stack (see Known limitations)
+scripts/v3 up-dev
 
-# 3. Create DynamoDB table + SQS queue (first time only)
-scripts/v3 setup-tables
+# 3. Create DynamoDB table + SQS queue (first time only) (see Known limitations)
+scripts/v3 setup-tables  # (see Known limitations)
 
-# 4. One-time handshake (during a screen-share with the other party)
+# 4. Handshake helper (see Known limitations)
 scripts/v3 init-handshake --role operator \
                        --cloud http://cloud:8443 \
                        --bootstrap-token <BOOTSTRAP_TOKEN>
 
-# 5. Backup your keys
+# 5. Backup helper (see Known limitations)
 scripts/v3 backup
 
 # 6. Admin UI
-open http://localhost:8011/admin
+# Visit http://localhost:8011/admin in your browser
 ```
 
 ---
 
-## Production deploy (AWS free tier)
+## Production deploy (Lambda)
+
+See Known limitations before using the deployment and handshake helpers.
 
 ```bash
 # One-time: create DynamoDB table + SQS queue in prod AWS
-scripts/v3 setup-tables
+scripts/v3 setup-tables  # (see Known limitations)
 
-# Deploy the two Lambdas (needs AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY in .env)
-scripts/v3 deploy-api          # -> prints API Gateway URL
-scripts/v3 deploy-dispatcher   # -> wires SQS trigger
+# Deploy helpers require AWS credentials, table, queue and execution-role ARNs
+scripts/v3 deploy-api          # prints a next step to configure API Gateway
+scripts/v3 deploy-dispatcher   # first creation wires SQS; asserts a sweep schedule
 
 # Handshake both parties against the API Gateway URL
 scripts/v3 init-handshake --role operator \
@@ -95,39 +98,45 @@ they only run a terminal, no cloud infra needed.
 ## All `scripts/v3` verbs
 
 ```
-scripts/v3 up                Start cloud + dispatcher + terminal (dev mode)
+scripts/v3 up                Start terminal connected to Lambda
+scripts/v3 up-dev            Request full local dev stack (see Known limitations)
 scripts/v3 up-cloud          Start cloud only
 scripts/v3 up-terminal       Start terminal only (client deploy)
 scripts/v3 down              Stop everything
 scripts/v3 bounce            Restart (keeps volumes)
-scripts/v3 logs [svc]        Tail logs (cloud|ep-v3-dispatcher|terminal)
-scripts/v3 shell <svc>       Interactive shell
-scripts/v3 ps                List containers
-scripts/v3 init-handshake    One-time keypair exchange with peer + cloud
-scripts/v3 backup            Encrypted zip of state + keys
-scripts/v3 admin-bcrypt      Generate ADMIN_PASSWORD_HASH
-scripts/v3 check <name>      Health/consistency checks (all = full sweep)
-scripts/v3 probe <name>      Adversarial leak probes
-scripts/v3 setup-tables      Create DynamoDB table + SQS queue (local or prod)
-scripts/v3 deploy-api        Package + deploy ep-api Lambda
-scripts/v3 deploy-dispatcher Package + deploy ep-dispatcher Lambda
+scripts/v3 logs [svc]        Tail terminal logs (pass terminal)
+scripts/v3 shell <svc>       Interactive shell (terminal only)
+scripts/v3 ps                List terminal containers
+scripts/v3 init-handshake    Invoke handshake helper (see Known limitations)
+scripts/v3 backup            Invoke backup helper (see Known limitations)
+scripts/v3 admin-bcrypt      Invoke password-hash helper (see Known limitations)
+scripts/v3 check <name>      Invoke check helpers (see Known limitations)
+scripts/v3 probe <name>      Invoke probe helpers (see Known limitations)
+scripts/v3 setup-tables      Create DynamoDB table + SQS queue (local or prod) (see Known limitations)
+scripts/v3 deploy-api        API deployment helper (see Known limitations)
+scripts/v3 deploy-dispatcher Dispatcher deployment helper (see Known limitations)
 scripts/v3 tail-api          CloudWatch log tail for ep-api
 scripts/v3 tail-dispatcher   CloudWatch log tail for ep-dispatcher
+scripts/v3 wire-sqs-trigger  Create a missing dispatcher SQS mapping (see Known limitations)
+scripts/v3 test [args]       Run pytest in the isolated test container
 ```
 
 ---
 
 ## Configuration model
 
-Only **one env var** (`BOOTSTRAP_TOKEN`) is required before first boot.
-Everything else lives in DynamoDB-backed settings, editable via the admin UI.
+Terminal login needs `ADMIN_EMAIL`, `ADMIN_PASSWORD_HASH` and `JWT_SECRET` on
+first boot. Cloud handshake needs `BOOTSTRAP_TOKEN`; infrastructure uses AWS,
+DynamoDB and SQS configuration. Settings migration reads known environment
+variables without overwriting existing rows.
 
-| Tab | Settings |
+| Page | Settings |
 |---|---|
-| Brand | Company name, support email, postal address, public host, from-address |
-| Auth | Admin email, password, JWT secret |
-| Cloud | Resend webhook secret |
-| Secrets | UNSUB + ERASURE HMAC secrets (auto-synced cloud↔terminal) |
+| Entities | Brand, support email, postal address, public host, sender, Resend key |
+| Operators | Password change, session lifetime, JWT rotation |
+| Suppression | Unsubscribe/erasure secrets and token TTLs |
+| Overview | K_temp TTL |
+| Sending | Window, pacing and batch size |
 
 Secrets are AES-256-GCM encrypted at rest with a per-side KEK.
 
@@ -143,7 +152,7 @@ src/mailman/
 deploy/           Dockerfiles, entrypoints, IAM policies, Lambda packaging
 scripts/          v3 CLI (up/down/deploy/backup/probe) + helpers
 tests/            pytest suite - runs the whole codebase in one env
-docs/             architecture + deployment guides
+docs/             cloud, deployment and test guides
 ```
 
 Both sides are subpackages of one installable package (`src/` layout), so
@@ -153,64 +162,111 @@ suite runs in a single environment.
 
 ## Hard rules
 
-1. **Cloud never has private keys.** Only K_op_pub, K_cl_pub, K_temp (TTL-bounded).
-2. **K_temp on cloud is TTL-bounded.** 1h/24h/7d; wiped on expiry; never extended.
-3. **Plaintext window during dispatch = milliseconds.** Decrypt -> POST -> discard.
-4. **Bearer auth on every sync/pack/key endpoint.** Bearer SHA-256-hashed in DynamoDB.
-5. **Webhook events encrypted to BOTH pubkeys** (outlive K_temp TTL).
-6. **Secrets encrypted at rest** with per-side KEK; decrypted only on read.
-7. **One env var required:** `BOOTSTRAP_TOKEN`. Everything else UI-driven.
+1. **Long-term KEM keys stay in terminal key storage.** The loader uses its own private key and the peer's public key.
+2. **K_temp is TTL-bounded.** Cloud accepts 1h/24h/7d and checks expiry when reading the key.
+3. **Dispatch decrypts to call Resend.** Finalisation clears the encrypted payload.
+4. **Bearer auth on sync/pack/key endpoints.** Bearer SHA-256 hashes live in DynamoDB.
+5. **Webhook events encrypted to both pubkeys** when both are registered.
+6. **Settings secrets encrypted at rest** with a per-side KEK; decrypted on read.
 
 ---
 
 ## Tests
 
 ```bash
-# Run inside project container (no pulled-generic images)
-docker run --rm \
-  -v $(pwd)/tests:/work/tests \
-  -v $(pwd)/cloud:/work/cloud \
-  -v $(pwd)/terminal:/work/terminal \
-  -e AWS_DEFAULT_REGION=us-east-1 \
-  -e AWS_ACCESS_KEY_ID=test \
-  -e AWS_SECRET_ACCESS_KEY=test \
-  -e DYNAMODB_TABLE=ep-v3-test \
-  -e BOOTSTRAP_TOKEN=test-token \
-  -e DISABLE_DISPATCHER=1 \
-  email-platform-v3-cloud \
-  python -m pytest /work/tests -q
-
-# 104/104 across:
-#   dynamo ops (counters, events, packs, sessions, pubkeys, compliance, K_temp)
-#   dispatcher (SQS record -> decrypt -> mock Resend -> sent/failed/stuck/retry)
-#   sync protocol (push/pull cursor / near-conflict / auth)
-#   handshake (register, bad bootstrap, duplicate-role)
-#   packs API (push/idempotency/cancel/enqueue/auth)
-#   webhook (HMAC/replay/duplicate/suppression)
-#   settings (KEK lifecycle, at-rest encryption, tamper detection, env-fallback)
-#   encryption (K_op+K_cl + K_temp + cross-side round-trips)
+# Runs the suite in the project's own test container (no host Python)
+bash scripts/v3 test
+bash scripts/v3 test tests/test_schedule_utc.py -rA     # one file
 ```
+
+October 2026 baseline: 645 passed, 1 skipped. Areas covered:
+- cloud: DynamoDB ops, the dispatcher (SQS record -> decrypt -> mocked Resend ->
+  sent / failed / unknown), the packs API (push, idempotency, cancel), sync,
+  handshake, webhooks, settings and encryption round-trips
+- terminal: launch and re-launch, batches and approvals, the scheduler (time
+  comparison, refusals, stages), archive and cancel, the test send, the From
+  header, the admin UI routes and the ORM schema
+- long seeded walks over the send path and over archive and cancel
+
+Resend and AWS are mocked in the suite. The real-send path has not been run
+against Resend for this release.
 
 ---
 
 ## Trade-offs (acknowledged)
 
-- Each terminal holds BOTH private keys (Reading A). One-PC compromise = full breach.
-  Mitigated by 6-location backup against data LOSS, not DISCLOSURE.
-- Cloud holds K_temp during TTL. Cloud compromise during TTL = readable K_temp payloads.
-  Operator picks TTL (1h/24h/7d) to size blast radius.
-- Lambda cold-start ~800ms (Mangum + FastAPI). Acceptable for sync/webhook.
-  Add provisioned concurrency if handshake UX suffers.
-- Last-write-wins by Lamport revision; near-simultaneous edits are flagged so
-  the operator can confirm the surviving version was the intended one.
-- Single-tenant (one DynamoDB table per engagement, NOT multi-client SaaS).
+- Each terminal loads its own long-term private key and the peer's public key;
+  it decrypts the wrap addressed to its own role.
+- Cloud holds K_temp during its TTL and can read pack payloads encrypted with it.
+- Incoming webhook and suppression events are materialised, but general
+  contact/template/campaign edits are not merged between terminals.
+- The default configuration uses one DynamoDB table and fixed Lambda names.
+
+---
+
+## Known limitations
+
+Sending
+- Archiving a campaign while the cloud is unreachable cancels its local batches,
+  but mail already handed to the cloud stays pending, and a later Archive does
+  not retry cancellation. Cancel the campaign while the cloud is reachable instead.
+- Resuming or retrying a campaign and then pressing Launch rebuilds batch
+  assignments and can release waiting recipients without their batch's approval.
+- Stages and Re-launches while batches await approval can leave those batches stuck.
+- Stage packs carry the campaign's scheduled time as their send time.
+- Cancelling a pack whose push has not landed yet can answer "not found" and
+  does not stop the later push.
+- A send whose outcome is unknown is shown as "unknown" and never re-sent; it is
+  not reconciled with Resend's own records.
+- Batch drain is based on the last scheduled send time, not confirmed delivery.
+
+Operator UI and API
+- Archive is one-way: an archived campaign is cloned to send it again.
+- Adding a deleted contact to a campaign answers a server error instead of a
+  clear refusal.
+- The entity set-key API accepts an empty Resend key over a working one.
+- The cloud settings form reaches the generic handler, which saves its value
+  under the local setting key `cloud`.
+- Several admin JSON list routes are shadowed by HTML pages of the same path.
+- The overview's sync card shows missing/stale pulls but does not display the
+  underlying logged sync error.
+- The Overview's Snapshot to backup button runs a backup helper the terminal image does not contain.
+
+Privacy
+- Erasure requests recorded by the cloud are not pulled to the terminal by the
+  active sync path. The legacy WireGuard path can deadlock on its audit write.
+  Check erasure requests by hand.
+
+Tooling
+- There is no automated restore command; backups are restored by hand.
+- The live e2e script's real-send leg is not wired: its gate always skips
+  (see docs/LIVE-E2E.md).
+- The dev compose file builds from a `./cloud` directory that no longer exists.
+- `scripts/v3 logs`, `shell` and `ps` use the terminal-only production compose
+  file and do not reach the dev-stack services.
+- `scripts/v3 admin-bcrypt` runs the `email-platform-v3-terminal` image tag,
+  which compose does not create.
+- `scripts/v3 setup-tables` builds the `cloud` service from the terminal-only
+  production compose file, which does not define that service.
+- `scripts/v3 wire-sqs-trigger` runs the `email-platform-v3-cloud` image tag,
+  which nothing builds.
+- `scripts/_check/{drift,healthz,isolation,secret-locality,suppression-mirror,vault-sleep}`
+  target the retired v2 vault/backup topology; neither compose file defines
+  `ep-v3-vault`, `ep-v3-backup` or `ep-v3-front-edge`.
+- The local dispatcher's `run_forever()` imports `dispatcher_lambda` as a
+  top-level module, while that module uses `mailman.cloud` imports.
+- `scripts/v3 init-handshake` and `backup` mount files from an absent `bin/` directory.
+- `scripts/v3 deploy-api` and `deploy-dispatcher` packaging refers to absent
+  `cloud` and unmounted `/repo` paths.
+- `scripts/v3 check` and `probe` reference absent `bin/_check/` and `bin/_probe/` directories.
+- The handshake helper's manual private-key exchange reminder conflicts with
+  keeping each terminal's private keys local.
 
 ---
 
 ## Heritage
 
-- **v1** - AWS Amplify, PRD-faithful. 8 AWS services. Still running at a
-  client company.
+- **v1** - AWS Amplify. 8 AWS services.
 - **v2** - state/sender split via WireGuard. Shipped 2026-05-18.
 - **v3.0** - cloud-sync spinnable; all secrets env-driven.
 - **v3.1** - settings moved to DB-backed + UI-editable. Client-hosted-deploy guide.

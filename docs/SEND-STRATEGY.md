@@ -1,77 +1,74 @@
 # Send strategy - batched, windowed, seeded
 
-How MailMan paces a campaign. Goal: deliverability-safe, fully observable
-sending, with hard caps so an ESP's limits are never blown.
+How MailMan schedules and releases campaign batches.
 
 ## The model
 
 **Batches.** A campaign's deliverable contacts split into ordered batches of
-`send_batch_size`. Each batch is a row in `campaign_batches` with rolling counts.
-Batch 1 releases on launch; every later batch is gated.
+`send_batch_size`. Each batch is a row in `campaign_batches` with stored counters.
+Normal launch releases batch 1; manual approval releases later pending batches.
 
-**Manual approve-next, with an analytics cooldown.** When a batch fully drains it
-enters `cooldown`. Approve-next stays locked until the next day's window (~24h) so
-bounce/click/unsub data propagates first - you approve the next batch on real data,
-never blind.
+**Manual approve-next, with an analytics cooldown.** After a sending batch's
+last scheduled `send_at` passes, the scheduler marks it `drained` and sets
+`approve_unlock_at` to the next window opening. This tests scheduled time, not
+whether every provider outcome has arrived. Approval checks the previous
+batch's state and unlock time.
 
-**Daily send window.** Sending happens only inside a window of `send_window_hours`
-starting at `send_window_start_hour` in `send_window_tz` (DST-aware). Outside the
-window, sending pauses and resumes next day. A batch spans as many windows as needed.
+**Daily send window.** Batch `send_at` timestamps fall inside windows of
+`send_window_hours`, starting at `send_window_start_hour` in `send_window_tz`
+using `zoneinfo`. A batch can span multiple windows. These are due times;
+the cloud sweep and HTTP call can dispatch later than the scheduled time.
 
 **Parallel senders + end-of-window rush.** `send_sender_count` send cursors pace
-with randomised intervals (`send_jitter_min_s`–`send_jitter_max_s`). In the final
-`send_rush_tail_minutes` the interval collapses toward `send_rush_jitter_s`, so a
-window's remaining queue drains before the window closes instead of spilling into
-the next day.
+with randomised intervals (`send_jitter_min_s`-`send_jitter_max_s`). In the final
+`send_rush_tail_minutes` the gap becomes `send_rush_jitter_s * (0.5 + random())`.
+Remaining work rolls to another window if it does not fit.
 
-**Per-day cap.** `send_daily_cap` bounds sends per calendar window-day; when a day
-fills, all senders roll to the next window. Set this **under your ESP's daily limit**
-(e.g. a 100/day plan -> cap 90). Without it, the sender pacing can exceed the plan's
-quota and sends start failing.
+**Per-day cap.** `send_daily_cap` bounds scheduled sends per calendar window-day
+within one `compute_send_ats()` call, including seeds. Zero means unlimited.
+It is not a shared quota across batches or campaigns.
 
-**Safety.** Bounce-pause threshold and per-minute rate cap remain; the per-day
-single-campaign contact lock prevents a contact receiving more than one campaign per day.
+**Safety.** The dispatcher computes pacing delays from rate settings and doubles
+the delay when its in-process failure ratio reaches the bounce threshold after
+more than 10 sends.
+The contact lock refuses overlap while another campaign's lock is active;
+a body-link click releases that contact early. It is not a strict one-mail-per-day limit.
 
 ## How it's enforced (terminal-side scheduling)
 
 The window + pacing is a *terminal* concern. On launch/approval the scheduler computes a
 `send_at` per pack that falls inside upcoming windows at the sender + rush + cap cadence,
 and pushes the batch with those future `send_at`s; the cloud dispatcher releases each pack
-when it comes due (§4.2). The terminal is uninvolved during sending.
+when due. The terminal scheduler still manages batch drain and approval state.
 
-Packs are pushed in chunks (`PACK_PUSH_CHUNK`) - each carries an encrypted payload, so a
-full batch in one request exceeds API-gateway request-size limits.
+Packs are pushed in chunks (`PACK_PUSH_CHUNK`, default 100) to bound request
+sizes.
 
 ## Engagement signal: clicks only
 
-Opens are **not tracked**. Image proxies and security scanners fire the open pixel (and
-often the click redirect too), so opens are bot/MPP noise:
-- `open_tracking=False` on all sends; `click_tracking` stays on.
-- `email.opened` webhooks are ignored by the materialiser (kept raw for forensics only).
-- Opens are absent from analytics, batch-health, and agent surfaces.
+The dispatcher and campaign test-send requests set `open_tracking=False`
+and `click_tracking=True`.
 
-Engagement = body-link clicks. Note clicks still carry some scanner noise (a scanner
-click typically lands seconds after delivery; a human's arrives later) - treat click
-counts as an upper bound.
+- `email.opened` webhooks are ignored by the materialiser; the encrypted event
+  remains in the inbox.
+- The campaign analytics page shows sent, clicked, bounced and failed counts;
+  its batches card shows sent, clicked, bounced and unsub counts.
 
 ## Seed addresses / inbox-placement monitoring
 
-Placement must be measured, not assumed. Maintain a seed list of mailboxes you control
-across the providers that matter (Gmail, Outlook, Yahoo, iCloud, corporate).
+Active seed addresses are added to a nonempty batch in addition to its contacts.
+They do not count toward batch size, but they do count toward its scheduled
+send cap. Seed packs have no contact ID or local dispatched-job row, and do
+not enter contact analytics or the contact lock. Seed addresses bypass the
+contact suppression filter when batch packs are built.
 
-- **Salt every batch** - the active seed set rides every batch; batch 1's salt doubles as
-  the pre-flight check. Seeds are additive (they don't count toward batch size) and are
-  excluded from campaign analytics, suppression and the contact lock.
-- **Placement detection** - manual: check the seed inboxes and log inbox/spam per provider
-  on the campaign's batch card. (IMAP auto-detection is a possible future addition.)
-
-**Seeding measures placement; it does not fix it.** If seeds land in spam, the levers are
-SPF/DKIM/DMARC alignment, domain/IP warmup, list hygiene, content (spam-trigger phrases,
-link/image ratio, branded vs raw compliance links), and recipient engagement.
+Placement is logged manually as inbox, spam or promotions on the campaign's
+batch card. No automated inbox-placement detector is implemented.
 
 ## Settings reference
 
 `send_window_tz`, `send_window_start_hour`, `send_window_hours`, `send_sender_count`,
 `send_jitter_min_s`, `send_jitter_max_s`, `send_rush_tail_minutes`, `send_rush_jitter_s`,
-`send_batch_size`, `send_daily_cap` - all editable at `/admin/settings/sending`; changes
-apply to the next batch loaded, no redeploy.
+`send_batch_size` - editable at `/admin/settings/sending`; changes apply to the
+next batch loaded. `send_daily_cap` is read from settings but has no field on
+that page; it can be set through `/admin/settings/api`.
