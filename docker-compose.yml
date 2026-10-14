@@ -1,4 +1,4 @@
-# MailMan 3.24 - terminal-only production config.
+# MailMan 4.0.0 - terminal-only production config.
 #
 # Cloud infrastructure runs on AWS Lambda (ep-api + ep-dispatcher).
 # This compose file starts only the terminal container, which connects

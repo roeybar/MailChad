@@ -1,4 +1,4 @@
-# MailMan 3.24 - full LOCAL dev stack (localstack + dynamodb-local).
+# MailMan 4.0.0 - full LOCAL dev stack (localstack + dynamodb-local).
 # Use: scripts/v3 up-dev (see Known limitations in the README)
 # Production (real Lambda): scripts/v3 up
 
