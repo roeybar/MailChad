@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bin/_backup.py - full-stack backup (§9 + §13.8).
+"""scripts/_backup.py - full-stack backup (section 9).
 
 Covers ALL persistent state across the split architecture:
 
@@ -24,8 +24,14 @@ NOTE ON CLOUD DB: this stack uses DynamoDB (AWS), not Postgres/Neon/MySQL.
 The dynamo_snapshot covers the entire single-table design. No other cloud
 database exists in this architecture.
 
-Restore: bin/v3 restore <zip> - decrypts with passphrase, re-imports
-DynamoDB items, restores SQLite + keys to volumes.
+Automated restore is not provided; restore by hand from the archive.
+Use manifest.json's scrypt parameters and salt with the passphrase to derive
+the key, verify the manifest HMAC, then decrypt each .enc entry with AES-256-GCM
+using its recorded nonce and verify its SHA-256 checksum. Restore the SQLite
+snapshot and extract the decrypted key tarball into the terminal volume.
+If included, re-import the decrypted DynamoDB JSON items by hand, decoding
+__bytes_b64 values and converting JSON numbers and sets for DynamoDB.
+sqs_state.json records counts only; it does not contain queued messages.
 """
 from __future__ import annotations
 
@@ -46,6 +52,10 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+from sqlalchemy import func, select
+
+from mailman.terminal import db
+from mailman.terminal.models import InboxRow, Setting
 
 
 KEYS_DIR   = Path(os.environ.get("TERMINAL_KEYS_DIR", "/var/lib/terminal/keys"))
@@ -123,17 +133,22 @@ def check_inbox(db_path: Path) -> dict:
     if not db_path.exists():
         return {"error": "DB not found"}
     try:
-        conn = sqlite3.connect(db_path)
-        total   = conn.execute("SELECT count(*) FROM inbox").fetchone()[0]
-        # 'pack' rows are handled by outcomes_loop, not the materialiser - exclude from warning
-        pending = conn.execute(
-            "SELECT count(*) FROM inbox WHERE materialised_at IS NULL "
-            "AND table_name IN ('webhook_event', 'suppression')"
-        ).fetchone()[0]
-        pack_pending = conn.execute(
-            "SELECT count(*) FROM inbox WHERE materialised_at IS NULL AND table_name = 'pack'"
-        ).fetchone()[0]
-        conn.close()
+        eng = db.readonly_engine(db_path)
+        try:
+            with eng.connect() as c:
+                total   = c.execute(select(func.count()).select_from(InboxRow)).scalar_one()
+                # 'pack' rows are handled by outcomes_loop, not the materialiser - exclude from warning
+                pending = c.execute(
+                    select(func.count()).select_from(InboxRow)
+                    .where(InboxRow.materialised_at.is_(None),
+                           InboxRow.table_name.in_(["webhook_event", "suppression"]))
+                ).scalar_one()
+                pack_pending = c.execute(
+                    select(func.count()).select_from(InboxRow)
+                    .where(InboxRow.materialised_at.is_(None), InboxRow.table_name == "pack")
+                ).scalar_one()
+        finally:
+            eng.dispose()
         return {"total_inbox": total, "unmaterialised": pending,
                 "pack_pending_outcomes_loop": pack_pending,
                 "warning": (f"{pending} webhook/suppression inbox rows not yet materialised - "
@@ -150,17 +165,20 @@ def check_secret_sync(db_path: Path) -> dict:
     if not db_path.exists():
         return {"error": "DB not found"}
     try:
-        conn = sqlite3.connect(db_path)
-        for skey in ("unsub_secret", "erasure_secret"):
-            row = conn.execute("SELECT value FROM settings WHERE key=?", (skey,)).fetchone()
-            val = row[0] if row and row[0] else None
-            if val:
-                # Hash the stored value (may be encrypted blob) - 16 hex chars to verify parity, not brute-forceable
-                result[f"{skey}_sha256_prefix"] = hashlib.sha256(val.encode()).hexdigest()[:16]
-            else:
-                result[f"{skey}_sha256_prefix"] = None
-                result[f"{skey}_warning"] = f"{skey} not configured in terminal settings - unsubscribe links will not work"
-        conn.close()
+        eng = db.readonly_engine(db_path)
+        try:
+            with eng.connect() as c:
+                for skey in ("unsub_secret", "erasure_secret"):
+                    row = c.execute(select(Setting.value).where(Setting.key == skey)).first()
+                    val = row[0] if row and row[0] else None
+                    if val:
+                        # Hash the stored value (may be encrypted blob) - 16 hex chars to verify parity, not brute-forceable
+                        result[f"{skey}_sha256_prefix"] = hashlib.sha256(val.encode()).hexdigest()[:16]
+                    else:
+                        result[f"{skey}_sha256_prefix"] = None
+                        result[f"{skey}_warning"] = f"{skey} not configured in terminal settings - unsubscribe links will not work"
+        finally:
+            eng.dispose()
         result["note"] = ("After restore: verify DynamoDB SETTING#unsub_secret and SETTING#erasure_secret "
                           "match terminal settings. Mismatch breaks all existing unsubscribe/erasure links.")
     except Exception as e:
@@ -277,11 +295,9 @@ def snapshot_db() -> bytes:
     with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as tmp:
         tmp_path = Path(tmp.name)
     try:
-        src = sqlite3.connect(DB_PATH)
-        dst = sqlite3.connect(tmp_path)
-        with dst:
-            src.backup(dst)
-        src.close(); dst.close()
+        with db.driver_connection(DB_PATH) as src, db.driver_connection(tmp_path) as dst:
+            with dst:
+                src.backup(dst)
         return tmp_path.read_bytes()
     finally:
         tmp_path.unlink(missing_ok=True)
@@ -308,10 +324,10 @@ ARCHITECTURE = {
     "terminal_keys":   "File-based at /var/lib/terminal/keys/",
     "email_provider":  "Resend (API key stored per-entity, encrypted in SQLite)",
     "restore_order": [
-        "1. Decrypt zip with passphrase",
+        "1. Automated restore is not provided; derive the key with the passphrase and manifest scrypt parameters, verify the manifest HMAC, decrypt .enc entries and verify SHA-256 checksums",
         "2. Restore SQLite to terminal volume",
         "3. Restore keys/ to terminal volume",
-        "4. Re-import DynamoDB items from dynamo_snapshot.json (bin/v3 restore-dynamo)",
+        "4. If included, re-import the decrypted DynamoDB JSON items by hand, decoding __bytes_b64 and converting numbers and sets for DynamoDB",
         "5. Verify unsub_secret + erasure_secret match between terminal settings and DynamoDB SETTING#* items",
         "6. Restart terminal - sync will resume from last cursor",
         "7. Re-queue any SQS messages if in-flight count was > 0 (re-launch affected campaigns)",
@@ -339,7 +355,7 @@ def main() -> int:
         if pw != pw2:
             sys.exit("passphrases don't match")
         if len(pw) < 12:
-            sys.exit("passphrase must be ≥ 12 chars")
+            sys.exit("passphrase must be \u2265 12 chars")
 
     BACKUP_OUT.mkdir(parents=True, exist_ok=True)
     ts       = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -456,7 +472,7 @@ def main() -> int:
     if verify_errors:
         print(f"[backup] INTEGRITY FAILURE - backup may be corrupt:")
         for err in verify_errors:
-            print(f"  ✗ {err}")
+            print(f"  \u2717 {err}")
         sys.exit(1)
     print("[backup] integrity check passed (decrypt + SHA-256 verified for all files)")
 
@@ -464,19 +480,19 @@ def main() -> int:
     print()
     covered = manifest["gaps_covered"]
     all_ok  = all(covered.values())
-    status  = "✓ COMPLETE" if all_ok else "⚠ PARTIAL"
+    status  = "\u2713 COMPLETE" if all_ok else "\u26A0 PARTIAL"
     print(f"[backup] {status} - wrote {out_path} ({size:,} bytes, chmod 600)")
     print()
     print("Coverage:")
     for gap, ok in covered.items():
-        print(f"  {'✓' if ok else '✗'} {gap.replace('_', ' ')}")
+        print(f"  {'\u2713' if ok else '\u2717'} {gap.replace('_', ' ')}")
     warnings = [inbox_info.get("warning"), sqs_info.get("warning"),
                 *[v for k, v in secret_sync.items() if k.endswith("_warning")]]
     for w in warnings:
-        if w: print(f"\n  ⚠ {w}")
+        if w: print(f"\n  \u26A0 {w}")
     print()
-    print("REMINDER (§9 - 6-location backup target):")
-    print("  1. This zip is location 1 (operator local)")
+    print("Backup archive:")
+    print("  1. This zip is stored locally")
     print("  2. Copy to: USB drive, encrypted external HD, cloud storage, remote host")
     print("  3. Restore passphrase: store separately from the zip")
     return 0

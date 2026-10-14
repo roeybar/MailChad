@@ -6,8 +6,8 @@ Without -> real AWS (needs valid creds + region in environment).
 
 Usage:
   python deploy/setup_tables.py
-  # or via bin/v3:
-  bin/v3 setup-tables
+  # or via scripts/v3:
+  scripts/v3 setup-tables
 """
 from __future__ import annotations
 

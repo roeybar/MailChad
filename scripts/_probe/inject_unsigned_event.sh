@@ -12,10 +12,10 @@ resp=$(curl -sS -o /tmp/_probe_out -w '%{http_code}' \
         "encrypted_payload":"AAAA","deleted":false}]')
 
 if [ "$resp" = "401" ]; then
-  echo "  ✓ unsigned event rejected (401 as expected)"
+  echo "  ok unsigned event rejected (401 as expected)"
   exit 0
 fi
-echo "  ✗ AUTH BYPASS: expected 401, got $resp"
+echo "  x AUTH BYPASS: expected 401, got $resp"
 cat /tmp/_probe_out | head -3
 rm -f /tmp/_probe_out
 exit 1

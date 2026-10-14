@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bin/_probe/replay_old_revision.sh - verifies replaying an old event is a no-op.
+# scripts/_probe/replay_old_revision.sh - pushes an older, unseen revision.
 # Sync is idempotent on (table, row_id, revision); replays should not cause data loss.
 # Requires CLOUD_URL + BEARER env set.
 set -euo pipefail
@@ -21,7 +21,7 @@ r=$(curl -sS -X POST "$CLOUD/sync/push" \
         "modified_at":"2026-05-19T01:00:00Z","key_id":"K_op+K_cl",
         "encrypted_payload":"","deleted":false}]')
 
-# Cloud accepts (event_log is append-only); terminals dedupe on revision.
-# Per §3.2: terminals' Lamport check ignores revisions <= local; replays no-op there.
-echo "  ✓ old-revision replay accepted by cloud (idempotency lives at terminal Lamport check)"
+# Cloud accepts (event_log is append-only); terminals dedupe exact revisions.
+# An older, unseen (table_name, row_id, revision) is stored in the terminal inbox.
+echo "  ok old-revision replay accepted by cloud (terminal deduplication checks exact revisions)"
 exit 0

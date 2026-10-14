@@ -28,7 +28,7 @@ print(json.dumps([{
   'key_id': f'K_temp_{e.k_temp_id(rogue_k)}',
   'encrypted_blob': base64.b64encode(env).decode(),
 }]))
-" -v /home/dev/email-platform-v3:/work 2>/dev/null)
+" -v "$(pwd)":/work 2>/dev/null)
 
 curl -sS -X POST "$CLOUD/packs" \
   -H "Authorization: Bearer $BEARER" -H "Content-Type: application/json" \
@@ -36,7 +36,7 @@ curl -sS -X POST "$CLOUD/packs" \
 
 ACCEPTED=$(grep -oE '"accepted":[0-9]+' /tmp/_probe_pack_push.json | cut -d: -f2)
 if [ "$ACCEPTED" -ne 1 ]; then
-  echo "  ✗ pack push didn't accept: $(cat /tmp/_probe_pack_push.json)"
+  echo "  x pack push didn't accept: $(cat /tmp/_probe_pack_push.json)"
   rm -f /tmp/_probe_pack_push.json
   exit 1
 fi
@@ -45,7 +45,7 @@ fi
 sleep 5
 
 # Check that no Resend send was attempted - only stuck_no_key would result
-echo "  ✓ pack injected with rogue K_temp; dispatcher should have marked it stuck_no_key"
+echo "  ok pack injected with rogue K_temp; dispatcher should have marked it stuck_no_key"
 echo "    (verify via cloud's /healthz packs_pending count or pack table inspection)"
 rm -f /tmp/_probe_pack_push.json
 exit 0

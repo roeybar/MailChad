@@ -1,6 +1,7 @@
 """Deploy ep-api or ep-dispatcher Lambda via boto3.
 
-Usage (called from bin/v3 deploy-api / deploy-dispatcher):
+Usage (helpers: scripts/v3 deploy-api / deploy-dispatcher;
+see Known limitations in the README):
   python /deploy/deploy_lambda.py api   <zip_path>
   python /deploy/deploy_lambda.py dispatcher <zip_path>
 

@@ -26,11 +26,11 @@ elapsed=$(($(date +%s) - start))
 
 if [ "$resp" = "200" ]; then
   accepted=$(grep -oE '"accepted":[0-9]+' /tmp/_probe_flood_out | cut -d: -f2)
-  echo "  ✓ flood $N events accepted in ${elapsed}s (accepted=$accepted)"
+  echo "  ok flood $N events accepted in ${elapsed}s (accepted=$accepted)"
   rm -f /tmp/_probe_flood_out
   exit 0
 fi
-echo "  ✗ flood failed: $resp"
+echo "  x flood failed: $resp"
 cat /tmp/_probe_flood_out | head -3
 rm -f /tmp/_probe_flood_out
 exit 1

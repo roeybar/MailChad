@@ -19,11 +19,11 @@ resp=$(curl -sS -o /tmp/_probe_out -w '%{http_code}' \
   -d "{\"role\":\"operator\",\"kem_pub\":\"$NEW_PUB\"}")
 
 if [ "$resp" = "409" ]; then
-  echo "  ✓ pubkey re-register rejected (409 - handshake is one-shot per role)"
+  echo "  ok pubkey re-register rejected (409 - handshake is one-shot per role)"
   rm -f /tmp/_probe_out
   exit 0
 fi
-echo "  ✗ HANDSHAKE BYPASS: expected 409, got $resp"
+echo "  x HANDSHAKE BYPASS: expected 409, got $resp"
 cat /tmp/_probe_out | head -3
 rm -f /tmp/_probe_out
 exit 1

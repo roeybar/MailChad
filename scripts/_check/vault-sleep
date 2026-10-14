@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Targets the retired v2 vault/backup topology.
 # bin/_check/vault-sleep
 # Verify the vault is asleep (not running). If it's awake, check how long.
 # Red if vault has been awake > 30 min without an authenticated session.
@@ -8,7 +9,7 @@ set -euo pipefail
 status=$(docker ps -a --filter "name=^ep-v3-vault$" --format '{{.State}}' 2>/dev/null | head -1)
 
 if [ -z "$status" ] || [ "$status" = "exited" ] || [ "$status" = "created" ]; then
-  echo "  ✓ vault: sleeping ($status)"
+  echo "  ok vault: sleeping ($status)"
   exit 0
 fi
 
@@ -21,7 +22,7 @@ if [ "$status" = "running" ]; then
     echo "  - vault: awake ($((age_s / 60))m), within tolerance"
     exit 0
   fi
-  echo "  ✗ vault: awake $((age_s / 60))m - exceeds 30m tolerance"
+  echo "  x vault: awake $((age_s / 60))m - exceeds 30m tolerance"
   exit 1
 fi
 

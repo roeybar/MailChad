@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Targets the retired v2 vault/backup topology.
 # bin/_check/drift
 # Call vault's /sync/drift endpoint (read-only). Red if any CRITICAL drift.
 # Vault must be awake.
@@ -11,7 +12,7 @@ fi
 
 resp=$(docker exec ep-v3-vault curl -sf http://localhost:8000/sync/drift?unack_only=true 2>&1)
 if [ -z "$resp" ]; then
-  echo "  ✗ drift: could not reach vault"
+  echo "  x drift: could not reach vault"
   exit 1
 fi
 
@@ -28,11 +29,11 @@ warn=$(echo "$critical" | cut -d'|' -f2)
 total=$(echo "$critical" | cut -d'|' -f3)
 
 if [ "$crit" -gt 0 ]; then
-  echo "  ✗ drift: $crit CRITICAL + $warn WARN ($total total unacked)"
+  echo "  x drift: $crit CRITICAL + $warn WARN ($total total unacked)"
   exit 1
 fi
 if [ "$warn" -gt 0 ]; then
   echo "  ~ drift: 0 CRITICAL but $warn WARN ($total total unacked)"
   exit 0
 fi
-echo "  ✓ drift: clean ($total unacked entries)"
+echo "  ok drift: clean ($total unacked entries)"

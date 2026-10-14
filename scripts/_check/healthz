@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Targets the retired v2 vault/backup topology.
 # bin/_check/healthz
 # Hit /healthz on every running container.
 set -euo pipefail
@@ -10,10 +11,10 @@ probe() {
     return 0
   fi
   if docker exec "$container" curl -sf "http://localhost:${port}/healthz" >/dev/null 2>&1; then
-    echo "  ✓ $label: healthz ok"
+    echo "  ok $label: healthz ok"
     return 0
   fi
-  echo "  ✗ $label: healthz failed"
+  echo "  x $label: healthz failed"
   return 1
 }
 

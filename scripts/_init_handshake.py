@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""bin/_init_handshake.py - interactive handshake script (§7, §13.7).
+"""scripts/_init_handshake.py - interactive handshake script (section 7).
 
 Runs INSIDE the email-platform-v3-terminal container so we have nacl available.
 
 --cloud is the cloud's public base URL. In production this is the AWS API
-Gateway URL produced by `bin/v3 deploy-api`, e.g.:
+Gateway URL configured after deployment, e.g.:
     https://<api-gw-id>.execute-api.us-east-1.amazonaws.com
 or a custom domain mapped to it:
     https://api.your-domain.com
@@ -17,12 +17,7 @@ Algorithm:
   4. Print own pubkey for the other party to capture
   5. Prompt for peer's pubkey (paste in) -> write to KEYS_DIR/peer_kem_pub.key
   6. Verify peer's pubkey matches what cloud has registered (via /pubkeys)
-  7. (Out-of-band): operator's terminal also receives K_<peer>_priv from peer
-     via the screen-share - see step 6 of spec §7. NOT automated; user pastes.
-
-Per Reading A (§2.1), each terminal holds both private keys after step 7.
-This step is left for the operator to perform manually during the
-screen-share session (cannot automate over the wire securely).
+  7. Print manual follow-up instructions (see Known limitations in the README).
 """
 from __future__ import annotations
 
@@ -92,12 +87,12 @@ def main() -> int:
         return 1
     data = r.json()
     bearer = data["bearer"]
-    print(f"[handshake] ✓ registered (fingerprint={data['fingerprint']})")
+    print(f"[handshake] \u2713 registered (fingerprint={data['fingerprint']})")
 
     # 3. Store bearer.
     bearer_path.write_text(bearer)
     os.chmod(bearer_path, 0o600)
-    print(f"[handshake] ✓ bearer stored at {bearer_path}")
+    print(f"[handshake] \u2713 bearer stored at {bearer_path}")
 
     # 4. Print own pubkey for the other party.
     print()
@@ -122,7 +117,7 @@ def main() -> int:
 
     peer_pub_path.write_bytes(peer_bytes)
     os.chmod(peer_pub_path, 0o600)
-    print(f"[handshake] ✓ peer pubkey stored at {peer_pub_path}")
+    print(f"[handshake] \u2713 peer pubkey stored at {peer_pub_path}")
 
     # 6. Verify against cloud's registered pubkeys.
     try:
@@ -132,9 +127,9 @@ def main() -> int:
         peer_role = "client" if args.role == "operator" else "operator"
         if peer_role in cloud_keys:
             if cloud_keys[peer_role] == peer_b64:
-                print(f"[handshake] ✓ peer pubkey matches cloud's registered {peer_role} pubkey")
+                print(f"[handshake] \u2713 peer pubkey matches cloud's registered {peer_role} pubkey")
             else:
-                print(f"[handshake] ✗ MISMATCH between pasted peer pubkey and cloud's registered {peer_role}")
+                print(f"[handshake] \u2717 MISMATCH between pasted peer pubkey and cloud's registered {peer_role}")
                 print("  This is a serious red flag - investigate before proceeding.")
                 return 3
         else:
@@ -142,21 +137,21 @@ def main() -> int:
     except Exception as e:
         print(f"[handshake] could not verify against cloud: {e}")
 
-    # 7. Reminder for the out-of-band private-key exchange (§7 step 5).
+    # 7. Reminder for the out-of-band private-key exchange.
     print()
     print("=" * 72)
-    print("NEXT MANUAL STEPS (per spec §7, Reading A):")
+    print("NEXT MANUAL STEPS (see Known limitations in the README):")
     print()
     peer_priv_path = KEYS_DIR / "peer_kem_priv.key"
     print(f"1. The other party should send YOU their PRIVATE key (out-of-band, via the")
     print(f"   screen-share session). When they do, save it as:")
     print(f"     {peer_priv_path}")
-    print(f"   (operator gets client_priv; client gets operator_priv - Reading A backup)")
+    print(f"   (operator gets client_priv; client gets operator_priv)")
     print()
-    print(f"2. Once you have peer_kem_priv.key, fire 'bin/v3 backup' on both PCs +")
-    print(f"   to 2 offline media (§9). That's the 6-location backup target.")
+    print(f"2. Backup helper: 'scripts/v3 backup'")
+    print(f"   (see Known limitations in the README).")
     print()
-    print(f"3. Restart terminal: `bin/v3 bounce` - sync_client will now have")
+    print(f"3. Restart terminal: `scripts/v3 bounce` - sync_client will now have")
     print(f"   CLOUD_BEARER configured + KeyBundle ready.")
     print("=" * 72)
     print()

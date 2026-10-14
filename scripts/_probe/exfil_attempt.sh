@@ -18,7 +18,7 @@ fi
 
 # Take the first encrypted_payload and try to decrypt without keys
 docker run --rm \
-  -v /home/dev/email-platform-v3:/work \
+  -v "$(pwd)":/work \
   email-platform-v3-terminal python -c "
 import sys, json, base64
 sys.path.insert(0, '/work/terminal')
@@ -43,8 +43,8 @@ fake_priv = nacl.public.PrivateKey.generate()
 fake_bundle = e.KeyBundle('operator', fake_priv, nacl.public.PrivateKey.generate().public_key)
 try:
     e.decrypt_for_both(env_bytes, fake_bundle)
-    print('  ✗ EXFIL SUCCESS - encryption broken!')
+    print('  \u2717 EXFIL SUCCESS - encryption broken!')
     sys.exit(1)
 except (nacl.exceptions.CryptoError, Exception) as ex:
-    print(f'  ✓ decrypt without key fails (cryptographic isolation holds): {type(ex).__name__}')
+    print(f'  \u2713 decrypt without key fails (cryptographic isolation holds): {type(ex).__name__}')
 "

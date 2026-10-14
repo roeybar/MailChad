@@ -1,33 +1,38 @@
 #!/usr/bin/env bash
-# bin/v3 - operator wrapper for email-platform v3.2 (Lambda + DynamoDB architecture).
+# scripts/v3 - operator wrapper for email-platform v3 (Lambda + DynamoDB architecture).
 #
 # Verbs:
-#   bin/v3 up                Start cloud + dispatcher + terminal locally (dev mode)
-#   bin/v3 up-cloud          Start cloud only
-#   bin/v3 up-terminal       Start terminal only
-#   bin/v3 down              Stop everything
-#   bin/v3 bounce            Restart (keeps volumes)
-#   bin/v3 logs [svc]        Tail logs (cloud|ep-v3-dispatcher|terminal)
-#   bin/v3 shell <svc>       Interactive shell
-#   bin/v3 ps                List containers
-#   bin/v3 init-handshake    One-time setup: generate keypairs, exchange with cloud
-#   bin/v3 backup            One-click backup of terminal state
-#   bin/v3 check <name>      Run a health/consistency check (`all`)
-#   bin/v3 probe <name>      Run an adversarial leak probe
-#   bin/v3 admin-bcrypt      Generate bcrypt hash for ADMIN_PASSWORD_HASH
-#   bin/v3 setup-tables      Create DynamoDB table + SQS queue (local or prod AWS)
-#   bin/v3 deploy-api        Package + deploy ep-api Lambda to AWS
-#   bin/v3 deploy-dispatcher Package + deploy ep-dispatcher Lambda to AWS
-#   bin/v3 tail-api          Tail ep-api CloudWatch logs
-#   bin/v3 tail-dispatcher   Tail ep-dispatcher CloudWatch logs
-#   bin/v3 help
+#   scripts/v3 up                Start terminal connected to Lambda
+#   scripts/v3 up-dev            Request full local dev stack
+#   scripts/v3 up-cloud          Start cloud only
+#   scripts/v3 up-terminal       Start terminal only
+#   scripts/v3 down              Stop everything
+#   scripts/v3 bounce            Restart (keeps volumes)
+#   scripts/v3 logs [svc]        Tail terminal logs (pass terminal)
+#   scripts/v3 shell <svc>       Interactive shell (terminal only)
+#   scripts/v3 ps                List terminal containers
+#   scripts/v3 init-handshake    Invoke handshake helper
+#   scripts/v3 backup            Invoke backup helper
+#   scripts/v3 check <name>      Invoke check helpers
+#   scripts/v3 probe <name>      Invoke probe helpers
+#   scripts/v3 admin-bcrypt      Invoke password-hash helper
+#   scripts/v3 setup-tables      Create DynamoDB table + SQS queue (local or prod AWS)
+#   scripts/v3 deploy-api        Package + deploy ep-api Lambda to AWS
+#   scripts/v3 deploy-dispatcher Package + deploy ep-dispatcher Lambda to AWS
+#   scripts/v3 tail-api          Tail ep-api CloudWatch logs
+#   scripts/v3 tail-dispatcher   Tail ep-dispatcher CloudWatch logs
+#   scripts/v3 wire-sqs-trigger  Create a missing dispatcher SQS mapping
+#   scripts/v3 test [args]       Run the test suite in the test image (pytest args pass through)
+#   scripts/v3 help
 
 set -euo pipefail
 PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
+export MSYS_NO_PATHCONV=1
+_host_root() { pwd -W 2>/dev/null || pwd; }
 
-ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
-fail() { printf '  \033[31m✗\033[0m %s\n' "$*" >&2; }
+ok()   { printf '  \033[32mok\033[0m %s\n' "$*"; }
+fail() { printf '  \033[31mx\033[0m %s\n' "$*" >&2; }
 info() { printf '  \033[34m->\033[0m %s\n' "$*"; }
 
 cmd_up()          { docker compose up -d; ok "terminal :8011 -> Lambda (real AWS)"; }
@@ -39,7 +44,7 @@ cmd_bounce()      { cmd_down >/dev/null 2>&1 || true; cmd_up; }
 cmd_logs()        { docker compose logs -f --tail=200 "${1:-cloud}"; }
 cmd_shell()       {
   local svc="${1:-}"
-  [ -n "$svc" ] || { echo "usage: bin/v3 shell <cloud|terminal|ep-v3-dispatcher>"; return 2; }
+  [ -n "$svc" ] || { echo "usage: scripts/v3 shell <terminal>"; return 2; }
   docker compose exec "$svc" bash
 }
 cmd_ps() { docker compose ps -a; }
@@ -47,13 +52,15 @@ cmd_ps() { docker compose ps -a; }
 cmd_init_handshake() {
   if [ "$#" -lt 3 ]; then
     echo "Usage:"
-    echo "  bin/v3 init-handshake --role <operator|client> \\"
+    echo "  scripts/v3 init-handshake --role <operator|client> \\"
     echo "                        --cloud <URL> \\"
     echo "                        --bootstrap-token <TOKEN>"
     echo ""
-    echo "  --cloud  Prod: API Gateway URL from 'bin/v3 deploy-api' output,"
+    echo "  --cloud  Prod: API Gateway URL configured after deployment,"
     echo "           e.g. https://<id>.execute-api.us-east-1.amazonaws.com"
     echo "           Dev: http://cloud:8443"
+    echo "  Deployment helper: scripts/v3 deploy-api prints a next step to configure API Gateway."
+    echo "  For these helpers, see Known limitations in the README."
     echo ""
     echo "Run ONCE during a screen-share session with the other party."
     echo "BOOTSTRAP_TOKEN must be set on the cloud before running."
@@ -293,6 +300,20 @@ cmd_tail_dispatcher() {
   _aws_cli logs tail "/aws/lambda/ep-dispatcher" --follow --region "$region"
 }
 
+cmd_test() {
+  docker build -q -f deploy/terminal.Dockerfile -t mailman-terminal:test . >/dev/null || { fail "test image build failed"; return 1; }
+  local -a mounts=()
+  local n
+  for n in src tests scripts deploy docs README.md architecture.md pyproject.toml .env.example docker-compose.yml docker-compose.dev.yml .gitattributes requirements.txt LICENSE .github; do
+    if [ -e "$n" ]; then mounts+=(-v "$(_host_root)/$n:/repo/$n:ro"); fi
+  done
+  # V3_TEST_LABEL (optional): an extra docker label to identify the test container.
+  # WALK_SEEDS / WALK_SEED_START (optional): how many long-walk seeds to run, and the first one (tests/test_pack_push_retry.py -k walk_long).
+  docker run --rm --network none --memory 4g ${V3_TEST_LABEL:+--label "$V3_TEST_LABEL"} ${WALK_SEEDS:+-e WALK_SEEDS="$WALK_SEEDS"} ${WALK_SEED_START:+-e WALK_SEED_START="$WALK_SEED_START"} ${mounts[@]+"${mounts[@]}"} -w /repo \
+    -e PYTHONPATH=/repo/src -e PYTHONDONTWRITEBYTECODE=1 \
+    mailman-terminal:test python -m pytest -q -rfE -p no:cacheprovider "$@"
+}
+
 cmd_help() { sed -n '2,/^$/p' "$0" | sed 's/^# *//'; }
 
 case "${1:-help}" in
@@ -316,6 +337,7 @@ case "${1:-help}" in
   wire-sqs-trigger)  shift; cmd_wire_sqs_trigger "$@" ;;
   tail-api)          shift; cmd_tail_api "$@" ;;
   tail-dispatcher)   shift; cmd_tail_dispatcher "$@" ;;
+  test)              shift; cmd_test "$@" ;;
   help|-h|--help)    cmd_help ;;
   *) echo "unknown verb: $1"; cmd_help; exit 2 ;;
 esac
