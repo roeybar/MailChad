@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mailman"
-version = "3.23.0"
-description = "Zero-trust email dispatch platform - the cloud relays but cannot read your mail"
+version = "3.24.0"
+description = "MailMan - email campaigns from your own machine, relayed encrypted"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "AGPL-3.0-only" }
