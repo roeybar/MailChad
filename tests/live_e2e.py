@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MailMan live e2e (3.24)
+MailMan live e2e (4.0.0)
 Runs inside the terminal container against localhost:8000.
 
 Tests: auth, all frontend pages, contacts, templates, campaigns, entities,
@@ -1677,7 +1677,7 @@ def main() -> int:
         if not value:
             print(f"error: {name} is required", file=sys.stderr)
             return 2
-    print("\n\033[1mMailMan live e2e (3.24)\033[0m")
+    print("\n\033[1mMailMan live e2e (4.0.0)\033[0m")
     print(f"target: {BASE}")
 
     try:
