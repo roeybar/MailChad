@@ -22,4 +22,5 @@ else
   echo "WireGuard skipped: TERMINAL_WG_PRIVATE_KEY or CLOUD_WG_PUBLIC_KEY not set"
 fi
 
-exec uvicorn mailman.terminal.main:app --host 0.0.0.0 --port 8000
+# One worker only: the terminal's duplicate-send guard keeps in-process state (do not raise --workers or set WEB_CONCURRENCY).
+exec uvicorn mailman.terminal.main:app --host 0.0.0.0 --port 8000 --workers 1

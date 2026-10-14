@@ -1,11 +1,12 @@
-# email-platform v3.19 - full LOCAL dev stack (localstack + dynamodb-local).
-# Use: bin/v3 up-dev
-# Production (real Lambda): bin/v3 up
+# MailMan 3.24 - full LOCAL dev stack (localstack + dynamodb-local).
+# Use: scripts/v3 up-dev (see Known limitations in the README)
+# Production (real Lambda): scripts/v3 up
 
 services:
   dynamodb-local:
     image: amazon/dynamodb-local:latest
     container_name: ep-v3-dynamodb
+    mem_limit: 512m
     command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
     ports:
       - "127.0.0.1:8001:8000"
@@ -13,6 +14,7 @@ services:
   localstack:
     image: localstack/localstack:3
     container_name: ep-v3-localstack
+    mem_limit: 768m
     environment:
       SERVICES: sqs
       DEFAULT_REGION: us-east-1
@@ -21,6 +23,7 @@ services:
 
   cloud:
     container_name: ep-v3-cloud
+    mem_limit: 512m
     build: ./cloud
     env_file: .env
     environment:
@@ -43,6 +46,7 @@ services:
 
   ep-v3-dispatcher:
     container_name: ep-v3-dispatcher
+    mem_limit: 384m
     build: ./cloud
     env_file: .env
     environment:
@@ -64,6 +68,7 @@ services:
 
   terminal:
     container_name: ep-v3-terminal
+    mem_limit: 1g
     build:
       context: .
       dockerfile: deploy/terminal.Dockerfile

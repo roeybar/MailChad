@@ -1,15 +1,16 @@
-# email-platform v3.19 - terminal-only production config.
+# MailMan 3.24 - terminal-only production config.
 #
 # Cloud infrastructure runs on AWS Lambda (ep-api + ep-dispatcher).
 # This compose file starts only the terminal container, which connects
 # to the real Lambda via CLOUD_URL from .env.
 #
-# Local dev (full stack): bin/v3 up-dev
-# Production (Lambda):    bin/v3 up          ← default
+# Local dev (full stack): scripts/v3 up-dev (see Known limitations in the README)
+# Production (Lambda):    scripts/v3 up          <- default
 
 services:
   terminal:
     container_name: ep-v3-terminal
+    mem_limit: 1g
     build:
       context: .
       dockerfile: deploy/terminal.Dockerfile
