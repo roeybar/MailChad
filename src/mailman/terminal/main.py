@@ -1,15 +1,16 @@
 """
 terminal - v3.8 local admin UI + sync client.
 
-Runs on each party's laptop. Localhost binding only (:8000 -> 127.0.0.1).
+Runs on each party's laptop. The container server binds 0.0.0.0:8000;
+production compose publishes port 8011 on all host interfaces.
 
 Spec sections wired:
-  §3.3   sync_client.pull_loop + push_loop + outcomes_loop background tasks
-  §6     bearer-authed cloud client
-  §13.4  sync protocol implementation
-  §13.5  pack lifecycle - launch.py builds/encrypts/pushes packs to /packs
-  §13.7  init-handshake - bin/v3 init-handshake script
-  §13.8  one-click backup - bin/v3 backup verb
+  section 3.2   sync_client.pull_loop + push_loop + outcomes_loop background tasks
+  section 6     bearer-authed cloud client
+  section 3     sync protocol implementation
+  section 4     pack lifecycle - launch.py builds/encrypts/pushes packs to /packs
+  section 7     init-handshake - scripts/_init_handshake.py helper
+  section 9     backup - scripts/_backup.py helper
 """
 from __future__ import annotations
 
@@ -20,26 +21,32 @@ import logging
 import os
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import Response
+from sqlalchemy import func, insert, select
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
-from mailman.terminal import db, routes_admin, auth, admin_ui, sync_client, launch, settings, settings_api, admin_settings_ui
+from mailman.terminal import db, routes_admin, auth, admin_ui, sync_client, launch, settings, settings_api, admin_settings_ui, brand
 from mailman.terminal.auth import require_session
+from mailman.terminal.models import (AuditEvent, Campaign, Contact, Entity, InboxRow, Operator, OutboxRow,
+                                      SuppressionHash, SyncState, Template, cols)
 
 
 def _migrate_admin_to_operators() -> None:
     """One-time migration: copy settings admin creds into operators table if table is empty."""
     try:
-        with db.conn() as c:
-            count = c.execute("SELECT count(*) AS n FROM operators").fetchone()
+        with db.session() as s:
+            count = s.execute(select(func.count().label("n")).select_from(Operator)).mappings().first()
             if count and count["n"] > 0:
                 return
             admin_email = settings.get("admin_email", "") or ""
             admin_hash  = settings.get("admin_password_hash", "") or ""
             if admin_email and admin_hash:
-                c.execute(
-                    "INSERT OR IGNORE INTO operators (email, password_hash, role) VALUES (?, ?, 'admin')",
-                    (admin_email.strip().lower(), admin_hash),
+                s.execute(
+                    insert(Operator).prefix_with("OR IGNORE")
+                    .values(email=admin_email.strip().lower(), password_hash=admin_hash, role="admin")
+                    .execution_options(synchronize_session=False)
                 )
-                c.commit()
+                s.commit()
                 log.info("migrated admin credentials from settings to operators table")
     except Exception as e:
         log.warning("operator migration failed (non-fatal): %s", e)
@@ -70,7 +77,7 @@ async def on_startup() -> None:
                  len(migrated), ", ".join(migrated.keys()))
     db.audit(actor=f"system:terminal-{TERMINAL_ACTOR}", action="terminal.started")
 
-    # Start sync background tasks (per §13.4).
+    # Start sync background tasks (per section 3).
     # They no-op cleanly until the init handshake has populated CLOUD_BEARER.
     stop = asyncio.Event()
     app.state.sync_stop = stop
@@ -100,16 +107,28 @@ async def on_shutdown() -> None:
 
 @app.get("/healthz")
 async def healthz():
-    with db.conn() as c:
+    with db.session() as s:
         counts = {
-            "contacts":  c.execute("SELECT count(*) AS n FROM contacts").fetchone()["n"],
-            "campaigns": c.execute("SELECT count(*) AS n FROM campaigns").fetchone()["n"],
-            "suppression_hashes": c.execute("SELECT count(*) AS n FROM suppression_hashes").fetchone()["n"],
-            "inbox_pending":  c.execute("SELECT count(*) AS n FROM inbox WHERE materialised_at IS NULL").fetchone()["n"],
-            "outbox_pending": c.execute("SELECT count(*) AS n FROM outbox WHERE pushed_at IS NULL").fetchone()["n"],
-            "sync_cursor":    int((c.execute("SELECT value FROM sync_state WHERE key='last_pulled_event_id'").fetchone() or {"value": "0"})["value"]),
+            "contacts":  s.execute(select(func.count().label("n")).select_from(Contact)).mappings().first()["n"],
+            "campaigns": s.execute(select(func.count().label("n")).select_from(Campaign)).mappings().first()["n"],
+            "suppression_hashes": s.execute(
+                select(func.count().label("n")).select_from(SuppressionHash)).mappings().first()["n"],
+            "inbox_pending":  s.execute(
+                select(func.count().label("n")).select_from(InboxRow).where(InboxRow.materialised_at.is_(None))
+            ).mappings().first()["n"],
+            "outbox_pending": s.execute(
+                select(func.count().label("n")).select_from(OutboxRow).where(OutboxRow.pushed_at.is_(None))
+            ).mappings().first()["n"],
+            "sync_cursor":    int((s.execute(
+                select(SyncState.value).where(SyncState.key == "last_pulled_event_id")
+            ).mappings().first() or {"value": "0"})["value"]),
         }
     return {"status": "ok", "role": "terminal", "actor": TERMINAL_ACTOR, **counts}
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(content=brand.ICON_PNG, media_type="image/png")
 
 
 # Sync visibility endpoints (read-only)
@@ -117,14 +136,21 @@ async def healthz():
 @app.get("/sync/status")
 async def sync_status():
     """Local view: cursor, pending in/out, recent inbox events."""
-    with db.conn() as c:
-        cursor = (c.execute("SELECT value FROM sync_state WHERE key='last_pulled_event_id'").fetchone() or {"value": "0"})["value"]
-        inbox_pending  = c.execute("SELECT count(*) AS n FROM inbox WHERE materialised_at IS NULL").fetchone()["n"]
-        outbox_pending = c.execute("SELECT count(*) AS n FROM outbox WHERE pushed_at IS NULL").fetchone()["n"]
-        recent_inbox = [dict(r) for r in c.execute(
-            "SELECT event_id, table_name, row_id, revision, actor, received_at "
-            "FROM inbox ORDER BY received_at DESC LIMIT 20"
-        ).fetchall()]
+    with db.session() as s:
+        cursor = (s.execute(
+            select(SyncState.value).where(SyncState.key == "last_pulled_event_id")
+        ).mappings().first() or {"value": "0"})["value"]
+        inbox_pending  = s.execute(
+            select(func.count().label("n")).select_from(InboxRow).where(InboxRow.materialised_at.is_(None))
+        ).mappings().first()["n"]
+        outbox_pending = s.execute(
+            select(func.count().label("n")).select_from(OutboxRow).where(OutboxRow.pushed_at.is_(None))
+        ).mappings().first()["n"]
+        recent_inbox = [dict(r) for r in s.execute(
+            select(InboxRow.event_id, InboxRow.table_name, InboxRow.row_id, InboxRow.revision, InboxRow.actor,
+                   InboxRow.received_at)
+            .order_by(InboxRow.received_at.desc()).limit(20)
+        ).mappings().all()]
     return {
         "actor":          TERMINAL_ACTOR,
         "cursor":         int(cursor),
@@ -144,6 +170,11 @@ async def admin_campaign_launch(campaign_id: int, actor: str = "operator:unknown
         return await launch.launch_campaign(campaign_id, actor=actor)
     except launch.LaunchError as e:
         raise HTTPException(400, str(e))
+    except IntegrityError:
+        raise HTTPException(409, launch._concurrent_press_detail("launch"))
+    except SQLAlchemyError:
+        log.exception("launch failed")
+        raise HTTPException(500, "launch failed: a database error; the details are in the terminal log")
     except Exception as e:
         log.exception("launch failed: %s", e)
         raise HTTPException(500, f"launch failed: {e}")
@@ -171,19 +202,23 @@ async def system_status(_session=Depends(require_session)):
     bootstrap_ok = bool(bootstrap) and bootstrap not in ("changeme", "your-token-here", "CHANGEME")
 
     # Entity + template + contact counts
-    with db.conn() as c:
-        entity_count    = c.execute("SELECT count(*) FROM entities").fetchone()[0]
-        entity_key_ct   = c.execute("SELECT count(*) FROM entities WHERE resend_key_enc IS NOT NULL").fetchone()[0]
-        template_count  = c.execute("SELECT count(*) FROM templates").fetchone()[0]
-        contact_count   = c.execute("SELECT count(*) FROM contacts").fetchone()[0]
-        webhook_recent  = c.execute(
-            "SELECT count(*) FROM inbox WHERE table_name='webhook_event' "
-            "AND received_at >= datetime('now','-24 hours')"
-        ).fetchone()[0]
-        inbox_pending   = c.execute(
-            "SELECT count(*) FROM inbox WHERE materialised_at IS NULL "
-            "AND table_name IN ('webhook_event','suppression')"
-        ).fetchone()[0]
+    with db.session() as s:
+        entity_count    = s.execute(select(func.count()).select_from(Entity)).scalar_one()
+        entity_key_ct   = s.execute(
+            select(func.count()).select_from(Entity).where(Entity.resend_key_enc.is_not(None))
+        ).scalar_one()
+        template_count  = s.execute(select(func.count()).select_from(Template)).scalar_one()
+        contact_count   = s.execute(select(func.count()).select_from(Contact)).scalar_one()
+        webhook_recent  = s.execute(
+            select(func.count()).select_from(InboxRow)
+            .where(InboxRow.table_name == "webhook_event",
+                   InboxRow.received_at >= func.datetime("now", "-24 hours"))
+        ).scalar_one()
+        inbox_pending   = s.execute(
+            select(func.count()).select_from(InboxRow)
+            .where(InboxRow.materialised_at.is_(None),
+                   InboxRow.table_name.in_(("webhook_event", "suppression")))
+        ).scalar_one()
 
     unsub_secret_set   = bool(_settings.get("unsub_secret",   ""))
     erasure_secret_set = bool(_settings.get("erasure_secret", ""))
@@ -208,9 +243,8 @@ async def system_status(_session=Depends(require_session)):
 
 @app.get("/admin/audit-log")
 async def admin_audit_log(limit: int = 200, _session=Depends(require_session)):
-    with db.conn() as c:
-        rows = [dict(r) for r in c.execute(
-            "SELECT * FROM audit_event ORDER BY occurred_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()]
+    with db.session() as s:
+        rows = [dict(r) for r in s.execute(
+            select(*cols(AuditEvent)).order_by(AuditEvent.occurred_at.desc()).limit(limit)
+        ).mappings().all()]
     return {"events": rows}

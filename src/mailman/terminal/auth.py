@@ -1,10 +1,10 @@
 """Minimal admin auth for vault.
 
-Single-operator model (PRD-faithful with v1/v2). Email + bcrypt-hashed
+Single-operator model. Email + bcrypt-hashed
 password in env, JWT cookie session.
 
 ADMIN_EMAIL: plaintext email/handle
-ADMIN_PASSWORD_HASH: bcrypt hash (generate with bin/v3 admin-bcrypt)
+ADMIN_PASSWORD_HASH: bcrypt hash (helper: scripts/v3 admin-bcrypt; see Known limitations in the README)
 JWT_SECRET: base64-48
 
 Ported in spirit from email-platform/src/lib/auth/.
@@ -22,8 +22,10 @@ import base64
 import bcrypt
 from fastapi import APIRouter, Cookie, Form, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
+from sqlalchemy import func, select, update
 
 from mailman.terminal import db, settings
+from mailman.terminal.models import Operator
 
 log = logging.getLogger("terminal.auth")
 router = APIRouter()
@@ -126,7 +128,8 @@ def login_page(error: str | None = None) -> HTMLResponse:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sign in · MailMan</title>
+<link rel="icon" type="image/png" href="/favicon.ico">
+<title>Sign in \u00B7 MailMan</title>
 <script>(function(){{try{{var t=localStorage.getItem('mc_theme')||'light';document.documentElement.setAttribute('data-theme',t);}}catch(e){{}}}})();</script>
 <style>
 :root{{--font-sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--bg:oklch(0.984 0.002 285);--surface:oklch(1 0 0);--surface-2:oklch(0.975 0.003 285);--border:oklch(0.918 0.004 285);--border-2:oklch(0.862 0.006 285);--text:oklch(0.262 0.012 285);--text-muted:oklch(0.505 0.012 285);--text-dim:oklch(0.62 0.01 285);--accent:oklch(0.55 0.205 286);--accent-hover:oklch(0.48 0.205 286);--accent-press:oklch(0.43 0.2 286);--accent-soft:oklch(0.955 0.032 286);--accent-soft-2:oklch(0.925 0.052 286);--accent-border:oklch(0.86 0.07 286);--on-accent:oklch(0.99 0.005 286);--crit-fg:oklch(0.5 0.18 27);--crit-bg:oklch(0.955 0.045 27);--crit-bd:oklch(0.87 0.08 27);--shadow-sm:0 1px 2px oklch(0.2 0.02 285/0.06),0 1px 1px oklch(0.2 0.02 285/0.04);--shadow-lg:0 16px 48px oklch(0.2 0.02 285/0.18),0 4px 12px oklch(0.2 0.02 285/0.1);--ring:0 0 0 3px var(--accent-soft-2);--r-sm:6px;--r-lg:12px;--r-xl:16px;color-scheme:light}}
@@ -154,19 +157,19 @@ input:focus{{outline:none;border-color:var(--accent);box-shadow:var(--ring)}}
       <span class="mark">{mail_svg}</span>
       <div>
         <div style="font-weight:650;font-size:17px;letter-spacing:-0.03em">MailMan</div>
-        <div class="dim">ep-v3 terminal</div>
+        <div class="dim">MailMan v4 terminal</div>
       </div>
     </div>
     <h1 style="font-size:19px;letter-spacing:-0.025em;margin-bottom:4px">Sign in to your vault</h1>
-    <p style="color:var(--text-muted);font-size:13.5px;margin-bottom:20px">All plaintext data stays on this terminal. Authenticate to manage your sending vault.</p>
+    <p style="color:var(--text-muted);font-size:13.5px;margin-bottom:20px">The terminal encrypts rendered send jobs; the cloud dispatcher decrypts them with a temporary key to call Resend. Open tracking is off. Sign in to manage your campaigns.</p>
     {err_html}
     <form method="post" action="/admin/auth/login">
       <div class="field"><label for="email">Email</label><input type="text" id="email" name="email" autofocus autocomplete="username"></div>
-      <div class="field"><label for="password">Password</label><input type="password" id="password" name="password" placeholder="••••••••••••" autocomplete="current-password"></div>
+      <div class="field"><label for="password">Password</label><input type="password" id="password" name="password" placeholder="\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022" autocomplete="current-password"></div>
       <button class="btn" type="submit">Sign in</button>
     </form>
     <div style="display:flex;align-items:center;gap:7px;margin-top:18px;justify-content:center;color:var(--text-dim);font-size:12px">
-      {lock_svg} Session secured with JWT · bcrypt · AES-256-GCM at rest
+      {lock_svg} JWT sessions \u00B7 bcrypt passwords \u00B7 secret settings encrypted at rest
     </div>
   </div>
 </div>
@@ -188,11 +191,11 @@ def login_page_get(error: str | None = None):
 def _check_operator(email: str, password: str) -> dict | None:
     """Returns operator row dict if credentials match, else None."""
     try:
-        with db.conn() as c:
-            row = c.execute(
-                "SELECT id, email, password_hash, role, active FROM operators WHERE email=?",
-                (email.strip().lower(),),
-            ).fetchone()
+        with db.session() as s:
+            row = s.execute(
+                select(Operator.id, Operator.email, Operator.password_hash, Operator.role, Operator.active)
+                .where(Operator.email == email.strip().lower())
+            ).mappings().first()
         if not row:
             return None
         if not row["active"]:
@@ -206,9 +209,12 @@ def _check_operator(email: str, password: str) -> dict | None:
 
 def _update_last_login(operator_id: int) -> None:
     try:
-        with db.conn() as c:
-            c.execute("UPDATE operators SET last_login_at=datetime('now') WHERE id=?", (operator_id,))
-            c.commit()
+        with db.session() as s:
+            s.execute(
+                update(Operator).where(Operator.id == operator_id)
+                .values(last_login_at=func.datetime("now")).execution_options(synchronize_session=False)
+            )
+            s.commit()
     except Exception:
         pass
 
