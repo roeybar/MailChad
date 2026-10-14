@@ -27,16 +27,16 @@ First-boot login also needs `ADMIN_EMAIL`, `ADMIN_PASSWORD_HASH` and `JWT_SECRET
 The wrapper uses Docker Compose for the terminal.
 
 ```bash
-git clone <repo-url-from-operator> email-platform
-cd email-platform
+git clone https://github.com/roeybar/MailMan.git
+cd MailMan
 ```
 
 ### 2. Create your .env
 
 Copy `.env.example` to `.env`, then set `TERMINAL_ACTOR=client` and the cloud's
 `CLOUD_URL`. Set `ADMIN_EMAIL`, a bcrypt `ADMIN_PASSWORD_HASH` and a random
-`JWT_SECRET` for initial login. Password-hash helper: `scripts/v3 admin-bcrypt`
-(see Known limitations in the README). The handshake requires the cloud's `BOOTSTRAP_TOKEN`.
+`JWT_SECRET` for initial login. Password-hash helper: `scripts/v3 admin-bcrypt`.
+The handshake requires the cloud's `BOOTSTRAP_TOKEN`.
 The terminal startup migrates known env settings without overwriting existing
 settings rows.
 
@@ -46,7 +46,7 @@ settings rows.
 scripts/v3 up-terminal
 ```
 
-Your admin UI is now at `http://localhost:8011`. The cloud is Lambda; you
+Your admin UI is now at `http://localhost:8011/admin`. The cloud is Lambda; you
 are not running the cloud container at all.
 
 ### 4. Run the handshake (screen-share with the operator)

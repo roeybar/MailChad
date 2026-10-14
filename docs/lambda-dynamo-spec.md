@@ -156,7 +156,7 @@ the local dispatcher.
 
 ---
 
-## scripts/v3 new verbs
+## scripts/v3 cloud verbs
 
 ```
 scripts/v3 setup-tables           Create DynamoDB table + SQS queue (local or prod) (see Known limitations)
@@ -177,7 +177,7 @@ scripts/v3 wire-sqs-trigger      Create a missing dispatcher SQS mapping (see Kn
 bash scripts/v3 test
 ```
 
-The October 2026 baseline is 645 passed, 1 skipped. AWS and Resend are mocked.
+The October 2026 baseline is 650 passed, 1 skipped. AWS and Resend are mocked.
 `tests/test_dynamo_ops.py`, `tests/test_packs.py`, `tests/test_keys_lifecycle.py`,
 `tests/test_handshake.py`, `tests/test_dispatcher.py` and
 `tests/test_sync_protocol.py` cover the storage and API paths.

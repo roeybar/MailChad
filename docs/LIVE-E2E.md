@@ -41,7 +41,7 @@ The direct test-send block uses `need_cloud=False`; it still ends in DEFERRED.
 
 | Class | Sections or labels |
 | --- | --- |
-| Needs neither cloud nor key | Auth, navigation, contact/template/entity/campaign CRUD, suppression, wacky and stress CRUD, audit, settings, system status, schedules, campaign operations/stages, rejected quicksend, selective export/import, contact/campaign edits, template/tag deletion, backup, test-send chain, add-to-campaign, batch tag import and seed CRUD. Local assertions in rate limiting and open tracking also run. |
+| Needs neither cloud nor key | Auth, navigation, contact/template/entity/campaign CRUD, suppression, edge-case and stress CRUD, audit, settings, system status, schedules, campaign operations/stages, rejected quicksend, selective export/import, contact/campaign edits, template/tag deletion, backup, test-send chain, add-to-campaign, batch tag import and seed CRUD. Local assertions in rate limiting and open tracking also run. |
 | Needs cloud | `lambda rate limit`, `lambda pack dispatch`, lambda webhook and sync/pull checks. Pack dispatch and sync/pull also need the container's bearer. |
 | Real mail, gated | `REAL SEND (global key)` |
 | Real mail, gated | `initial launch -> 200` (retry and cancel remain unconditional) |
@@ -53,8 +53,8 @@ The direct test-send block uses `need_cloud=False`; it still ends in DEFERRED.
 The pre-flight cleanup purges `seed-e2e@example.com`. Seed CRUD deletes its
 created seed after its checks, before the real-send gate. The gate precedes
 the batch-size setting change.
-Before the cleanup, the script refuses a terminal that still has a leftover `agent_token` setting (exit 2); it never prints the value.
-Earlier versions had a remote agent API that stored an agent_token setting; the script refuses a terminal that still holds one so it is not pointed at an old deployment by mistake.
+Before cleanup, the script refuses (exit 2) a terminal that still holds an
+agent_token setting from an older remote-API version; it never prints the value.
 
 ## Attended demo run
 

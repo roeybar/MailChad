@@ -51,8 +51,9 @@ and `click_tracking=True`.
 
 - `email.opened` webhooks are ignored by the materialiser; the encrypted event
   remains in the inbox.
-- The campaign analytics page shows sent, clicked, bounced and failed counts;
-  its batches card shows sent, clicked, bounced and unsub counts.
+- The campaign analytics page shows sent, clicked, bounced, complained and
+  failed counts, plus the campaign's rate limit and bounce threshold; its
+  batches card shows sent, clicked, bounced and unsub counts.
 
 ## Seed addresses / inbox-placement monitoring
 
