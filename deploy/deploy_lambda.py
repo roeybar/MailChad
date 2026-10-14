@@ -20,6 +20,10 @@ import boto3
 from botocore.exceptions import ClientError
 
 
+API_HANDLER = "mailman.cloud.lambda_handler.handler"
+DISPATCHER_HANDLER = "mailman.cloud.dispatcher_lambda.handler"
+
+
 def _client():
     return boto3.client(
         "lambda",
@@ -49,6 +53,10 @@ def deploy_api(zip_path: str) -> None:
     if exists:
         r = lam.update_function_code(FunctionName=fn, **code)
         print(f"  updated: {r['FunctionArn']}")
+        # The handler is part of the configuration, not the code: set it on every deploy.
+        lam.get_waiter("function_updated").wait(FunctionName=fn)
+        lam.update_function_configuration(FunctionName=fn, Handler=API_HANDLER)
+        lam.get_waiter("function_updated").wait(FunctionName=fn)
     else:
         role = os.environ["LAMBDA_ROLE_ARN"]
         env_vars = {
@@ -59,7 +67,7 @@ def deploy_api(zip_path: str) -> None:
             FunctionName=fn,
             Runtime="python3.12",
             Role=role,
-            Handler="mailman.cloud.lambda_handler.handler",
+            Handler=API_HANDLER,
             Code=code,
             Timeout=30,
             MemorySize=256,
@@ -120,9 +128,9 @@ def deploy_dispatcher(zip_path: str) -> None:
         r = lam.update_function_code(FunctionName=fn, **code)
         fn_arn = r["FunctionArn"]
         print(f"  updated: {fn_arn}")
-        # Refresh env so SQS_QUEUE_URL is present for the sweep (code update doesn't touch env)
+        # Refresh env and handler (a code update touches neither)
         lam.get_waiter("function_updated").wait(FunctionName=fn)
-        lam.update_function_configuration(FunctionName=fn, Environment={"Variables": env_vars})
+        lam.update_function_configuration(FunctionName=fn, Handler=DISPATCHER_HANDLER, Environment={"Variables": env_vars})
         lam.get_waiter("function_updated").wait(FunctionName=fn)
         print("  env refreshed (SQS_QUEUE_URL set)")
     else:
@@ -131,7 +139,7 @@ def deploy_dispatcher(zip_path: str) -> None:
             FunctionName=fn,
             Runtime="python3.12",
             Role=role,
-            Handler="mailman.cloud.dispatcher_lambda.handler",
+            Handler=DISPATCHER_HANDLER,
             Code=code,
             Timeout=60,
             MemorySize=256,
