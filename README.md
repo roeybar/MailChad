@@ -1,17 +1,22 @@
 # MailMan - email campaigns from your own machine, relayed encrypted
 
+<p><picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/icon-dark.svg"><img src="docs/img/icon.svg" width="120" alt="MailMan icon: a mail carrier holding up an envelope"></picture></p>
+
 MailMan prepares campaigns in a terminal app with local contacts, templates
 and encryption keys. The terminal encrypts rendered send jobs before handing
 them to the cloud. The cloud dispatcher decrypts those jobs with a temporary
 key to call Resend, then clears the stored encrypted payload on finalisation.
-Webhook and suppression events are encrypted to both terminals' public keys.
-The terminal schedules batches, applies suppression and controls approvals.
-
-![MailMan campaign analytics](docs/img/analytics.png)
+Webhook events, and suppressions derived from them, are encrypted to both
+terminals' public keys; one-click unsubscribes are stored and synced as SHA-256
+email hashes. The terminal schedules batches, applies suppression and controls
+approvals.
 
 [![CI](https://github.com/roeybar/MailMan/actions/workflows/ci.yml/badge.svg)](https://github.com/roeybar/MailMan/actions/workflows/ci.yml)
 
-**Status:** package version 4.0.0. October 2026 test baseline: 645 passed, 1 skipped; AWS and Resend are mocked. The real-send path has not been run against Resend for this release. The admin UI is branded v4; API and storage identifiers (ep-v3-*) stay as they are.
+**Status:** package version 4.0.0. October 2026 test baseline: 650 passed, 1
+skipped; AWS and Resend are mocked. The real-send path has not been run against
+Resend for this release. The admin UI is branded v4; the API, storage and tooling
+identifiers (ep-v3-*, the scripts/v3 wrapper, v3-backup files) keep their v3 names.
 
 **Spec:** [`docs/lambda-dynamo-spec.md`](docs/lambda-dynamo-spec.md)
 
@@ -40,7 +45,41 @@ The Lambda code path requires no always-on VPS.
 
 ---
 
-## Quick start (local dev)
+## Try it: demo mode (terminal only, no keys)
+
+The terminal runs on its own: the admin UI, contacts, templates and campaigns
+work without a cloud, AWS or a Resend key. Sending and sync stay off until a
+cloud is connected (the Overview shows "handshake pending").
+
+```bash
+# 1. Create .env
+cp .env.example .env
+
+# 2. Make a password hash and add the first-boot login to .env.
+#    Keep the single quotes around the hash: it contains $ signs.
+scripts/v3 admin-bcrypt            # prompts for a password, prints its hash
+# then add to .env:
+#   ADMIN_EMAIL=demo@example.com
+#   ADMIN_PASSWORD_HASH='<the printed hash>'
+#   JWT_SECRET=<a long random string, e.g. from: openssl rand -hex 32>
+
+# 3. Start the terminal
+scripts/v3 up-terminal
+
+# 4. Open http://localhost:8011/admin and sign in with that e-mail and password
+
+# 5. Stop it
+scripts/v3 down
+```
+
+---
+
+## Full local stack (not runnable from this repository yet)
+
+The full stack (local DynamoDB, the cloud API and the dispatcher) needs a
+`./cloud` build context and a `cloud` compose service that this repository
+does not contain, so `up-dev`, `setup-tables` and a local handshake do not run
+from a fresh clone (see Known limitations). The intended steps are:
 
 ```bash
 # 1. Create .env
@@ -100,7 +139,7 @@ they only run a terminal, no cloud infra needed.
 ```
 scripts/v3 up                Start terminal connected to Lambda
 scripts/v3 up-dev            Request full local dev stack (see Known limitations)
-scripts/v3 up-cloud          Start cloud only
+scripts/v3 up-cloud          Start cloud only (see Known limitations)
 scripts/v3 up-terminal       Start terminal only (client deploy)
 scripts/v3 down              Stop everything
 scripts/v3 bounce            Restart (keeps volumes)
@@ -109,7 +148,7 @@ scripts/v3 shell <svc>       Interactive shell (terminal only)
 scripts/v3 ps                List terminal containers
 scripts/v3 init-handshake    Invoke handshake helper (see Known limitations)
 scripts/v3 backup            Invoke backup helper (see Known limitations)
-scripts/v3 admin-bcrypt      Invoke password-hash helper (see Known limitations)
+scripts/v3 admin-bcrypt      Print a bcrypt hash for ADMIN_PASSWORD_HASH (needs .env)
 scripts/v3 check <name>      Invoke check helpers (see Known limitations)
 scripts/v3 probe <name>      Invoke probe helpers (see Known limitations)
 scripts/v3 setup-tables      Create DynamoDB table + SQS queue (local or prod) (see Known limitations)
@@ -179,7 +218,9 @@ bash scripts/v3 test
 bash scripts/v3 test tests/test_schedule_utc.py -rA     # one file
 ```
 
-October 2026 baseline: 645 passed, 1 skipped. Areas covered:
+CI also runs `ruff check --select E9,F63,F7,F82` (syntax errors and undefined names).
+
+October 2026 baseline: 650 passed, 1 skipped. Areas covered:
 - cloud: DynamoDB ops, the dispatcher (SQS record -> decrypt -> mocked Resend ->
   sent / failed / unknown), the packs API (push, idempotency, cancel), sync,
   handshake, webhooks, settings and encryption round-trips
@@ -238,6 +279,8 @@ Privacy
 - Erasure requests recorded by the cloud are not pulled to the terminal by the
   active sync path. The legacy WireGuard path can deadlock on its audit write.
   Check erasure requests by hand.
+- Unsubscribe-link suppressions are kept in DynamoDB as unsalted SHA-256 email
+  hashes, not encrypted to the terminals' keys.
 
 Tooling
 - There is no automated restore command; backups are restored by hand.
@@ -246,8 +289,6 @@ Tooling
 - The dev compose file builds from a `./cloud` directory that no longer exists.
 - `scripts/v3 logs`, `shell` and `ps` use the terminal-only production compose
   file and do not reach the dev-stack services.
-- `scripts/v3 admin-bcrypt` runs the `email-platform-v3-terminal` image tag,
-  which compose does not create.
 - `scripts/v3 setup-tables` builds the `cloud` service from the terminal-only
   production compose file, which does not define that service.
 - `scripts/v3 wire-sqs-trigger` runs the `email-platform-v3-cloud` image tag,
@@ -257,7 +298,8 @@ Tooling
   `ep-v3-vault`, `ep-v3-backup` or `ep-v3-front-edge`.
 - The local dispatcher's `run_forever()` imports `dispatcher_lambda` as a
   top-level module, while that module uses `mailman.cloud` imports.
-- `scripts/v3 init-handshake` and `backup` mount files from an absent `bin/` directory.
+- `scripts/v3 init-handshake` and `backup` mount files from an absent `bin/`
+  directory and use an image tag and volume name that compose does not create.
 - `scripts/v3 deploy-api` and `deploy-dispatcher` packaging refers to absent
   `cloud` and unmounted `/repo` paths.
 - `scripts/v3 check` and `probe` reference absent `bin/_check/` and `bin/_probe/` directories.
@@ -269,12 +311,15 @@ Tooling
 ## Heritage
 
 - **v1** - AWS Amplify. 8 AWS services.
-- **v2** - state/sender split via WireGuard. Shipped 2026-05-18.
+- **v2** - state/sender split via WireGuard.
 - **v3.0** - cloud-sync spinnable; all secrets env-driven.
 - **v3.1** - settings moved to DB-backed + UI-editable. Client-hosted-deploy guide.
   Cloudflare Tunnel model.
 - **v3.2** - Lambda + DynamoDB. No always-on VPS. Dispatcher decoupled to SQS.
   Client runs terminal only; operator deploys two Lambdas once.
-- **v3.8** - Multi-company support, WireGuard mesh, full live e2e suite (106 tests).
+- **v3.8** - Multi-company (entities) support; a live e2e script
+  (see docs/LIVE-E2E.md).
 - **v3.9** - MailMan design system (oklch, light/dark, icon nav). Settings moved
   inline to feature pages. JSON/HTML template import.
+- **v4.0** - SQLAlchemy models, send-path fixes, containerised tests; admin UI
+  branded v4.
