@@ -1,6 +1,6 @@
 # MailMan architecture
 
-The package version is 3.24.0 (`src/mailman/__init__.py` and `pyproject.toml`).
+The package version is 4.0.0 (`src/mailman/__init__.py` and `pyproject.toml`).
 
 ---
 
