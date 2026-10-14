@@ -219,6 +219,8 @@ Sending
 - A send whose outcome is unknown is shown as "unknown" and never re-sent; it is
   not reconciled with Resend's own records.
 - Batch drain is based on the last scheduled send time, not confirmed delivery.
+- Drain in-flight sends before upgrading the terminal: a send retried after an
+  upgrade is not deduplicated against one pushed before it.
 
 Operator UI and API
 - Archive is one-way: an archived campaign is cloned to send it again.
