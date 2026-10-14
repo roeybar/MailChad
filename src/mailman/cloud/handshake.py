@@ -1,4 +1,4 @@
-"""Init handshake endpoint - cloud side (spec §7 + §13.7).
+"""Init handshake endpoint - cloud side (spec section 7).
 
 ONE-TIME setup. Each party POSTs their KEM pubkey + a bootstrap token;
 cloud validates, registers the pubkey in the `pubkey` table, issues a
@@ -6,13 +6,11 @@ bearer token (stored as SHA-256 in `terminal_session`).
 
 The bootstrap token is a long random string set via the BOOTSTRAP_TOKEN
 env var on the cloud. It allows up to 2 registrations (operator + client),
-one each. After both roles are registered, additional handshake attempts
-with the same token are rejected - operator must rotate the token to
-re-handshake (e.g. after revoking compromised credentials).
+one each. Registration is rejected while that role's public key is present.
 
-Bearer tokens issued at handshake are long-lived but rotatable via
-DELETE /init/session (revokes a single bearer) or by re-running handshake
-with a fresh bootstrap token (revokes all + re-issues).
+For recovery, DELETE /init/handshake/{role} with the bootstrap token to
+revoke that role's public key and bearer sessions, then register it again
+with POST /init/handshake.
 """
 
 import base64
@@ -125,7 +123,7 @@ async def handshake_revoke(
 @router.get("/pubkeys")
 async def get_pubkeys():
     """Public - returns both registered pubkeys (base64). Anyone can read; they're public.
-    Used by terminals + cloud's webhook receiver (§4.3) for encrypt-to-both."""
+    Used by terminals + cloud's webhook receiver (section 4.3) for encrypt-to-both."""
     pubkeys = dynamo.get_all_pubkeys()
     return {
         actor: base64.b64encode(kem_pub_bytes).decode("ascii")

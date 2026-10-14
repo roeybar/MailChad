@@ -1,12 +1,7 @@
 """Public compliance endpoints - unsubscribe (RFC 8058) + GDPR erasure.
 
-Ported from coherence/backend/auth/app/routes_compliance_public.py.
-
-Differences from coherence version:
-- writes to local SQLite cache (unsub_hash_cache, erasure_request_cache)
-  instead of forwarding to a state-keeper over WG (vault is asleep)
-- copy is brand-neutral (uses {_company()} env var)
-- no JS, no external assets - server-rendered tiny HTML
+Validates signed tokens and records unsubscribe and erasure requests in DynamoDB.
+Serves HTML pages using the configured company name and support email.
 """
 
 import logging

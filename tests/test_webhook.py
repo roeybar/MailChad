@@ -1,4 +1,4 @@
-"""Tests for webhook receiver - §4.3, §10.4."""
+"""Tests for webhook receiver - section 4.3, section 10.4."""
 import base64
 import hashlib
 import hmac

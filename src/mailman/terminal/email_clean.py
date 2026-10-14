@@ -1,14 +1,10 @@
-"""Basic email cleaner - the import gate for compiled/scraped lists.
+"""Normalise and validate email addresses, dropping duplicates and invalid entries.
 
 No-network checks run always (fast, reliable): normalize, strict syntax, role-account
 drop, disposable-domain drop, in-batch dedup. MX check is opt-in (network) and only
 ever DROPS on a confirmed no-MX domain - never on lookup failure (fail-open), so a flaky
 resolver can't nuke a whole import.
 
-This is the gate, not a guarantee: it removes the obvious junk (dead syntax, role inboxes,
-throwaway domains, dead domains) that drives bounces + complaints on cold lists. It does
-NOT detect spam traps - those need a paid verification service. Surfaced honestly so nobody
-mistakes "cleaned" for "safe to blast".
 """
 from __future__ import annotations
 
@@ -18,7 +14,7 @@ import re
 _EMAIL_RE = re.compile(r"^[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*"
                        r"@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$")
 
-# Role / distribution addresses - low engagement, high complaint + trap risk on cold lists.
+# Role / distribution addresses rejected by clean_email.
 _ROLE_LOCALPARTS = {
     "info", "admin", "administrator", "support", "sales", "contact", "hello", "help",
     "office", "enquiries", "inquiries", "noreply", "no-reply", "donotreply", "postmaster",
@@ -39,7 +35,7 @@ def clean_email(raw: str) -> tuple[str | None, str | None]:
     if not raw:
         return None, "empty"
     email = raw.strip().lower()
-    # strip a leading mailto: and surrounding angle brackets sometimes seen in scrapes
+    # Strip a leading mailto: and surrounding angle brackets.
     email = email.removeprefix("mailto:").strip("<> \t")
     if not _EMAIL_RE.match(email):
         return None, "bad_syntax"

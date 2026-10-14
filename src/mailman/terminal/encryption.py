@@ -1,6 +1,6 @@
 """Encryption layer for v3.1 - terminal side.
 
-Implements the two modes from §2.2 of the v3.1 spec:
+Implements the two modes from section 2.2 of the v3.1 spec:
 
   K_op+K_cl mode  - random per-payload AES-256-GCM key, wrapped twice
                     (once for each party's KEM pubkey via NaCl SealedBox).
@@ -9,12 +9,10 @@ Implements the two modes from §2.2 of the v3.1 spec:
   K_temp mode      - AES-256-GCM directly with K_temp. Cloud CAN decrypt
                     during TTL. Used for packs only.
 
-Reading A (§2.1): each terminal holds BOTH KEM private keys (own + peer copy).
-Allows either terminal to decrypt anything if the other PC dies.
-Single-PC compromise = full breach; mitigated only by the 6-location backup
-property (§9), not by cryptographic separation.
+Each terminal loads its own KEM private key and the peer's public key.
+It decrypts the wrap addressed to its own role.
 
-Crypto stack (§2.4):
+Crypto stack (section 2.4):
   - KEM: NaCl SealedBox (X25519 + XSalsa20-Poly1305)
   - Symmetric: AES-256-GCM via cryptography library
   - Library: PyNaCl + cryptography (widely audited, no algo-choice landmines)
@@ -37,7 +35,7 @@ class KeyBundleNotReady(RuntimeError):
 
 
 class KeyBundle:
-    """The four keys a terminal needs after init handshake (§7).
+    """The four keys a terminal needs after init handshake (section 7).
 
     own_role:        'operator' or 'client'
     own_kem_priv:    nacl.public.PrivateKey - for decrypting messages encrypted to our pubkey
@@ -61,7 +59,7 @@ class KeyBundle:
         own_priv_path = KEYS_DIR / f"own_kem_priv.key"
         peer_pub_path = KEYS_DIR / f"peer_kem_pub.key"
         if not own_priv_path.exists() or not peer_pub_path.exists():
-            raise KeyBundleNotReady("run `bin/v3 init-handshake` to set up keys (§7)")
+            raise KeyBundleNotReady("keys missing - handshake helper: `scripts/v3 init-handshake` (see Known limitations in the README)")
         own_priv = nacl.public.PrivateKey(own_priv_path.read_bytes())
         peer_pub = nacl.public.PublicKey(peer_pub_path.read_bytes())
         k_temp_path = KEYS_DIR / "k_temp.bin"
@@ -69,7 +67,7 @@ class KeyBundle:
         return cls(role, own_priv, peer_pub, k_temp=k_temp)
 
 
-# K_op+K_cl mode (§2.2)
+# K_op+K_cl mode (section 2.2)
 
 def encrypt_for_both(plaintext: bytes, bundle: KeyBundle) -> bytes:
     """Random AES-256-GCM key wrapped twice (once for each party).
@@ -106,7 +104,7 @@ def decrypt_for_both(envelope_bytes: bytes, bundle: KeyBundle) -> bytes:
     return AESGCM(k).decrypt(nonce, ct, associated_data=None)
 
 
-# K_temp mode (§2.2)
+# K_temp mode (section 2.2)
 
 def encrypt_with_temp(plaintext: bytes, k_temp: bytes) -> bytes:
     """For packs only. Cloud will decrypt at dispatch time."""
@@ -123,7 +121,8 @@ def encrypt_with_temp(plaintext: bytes, k_temp: bytes) -> bytes:
 
 
 def decrypt_with_temp(envelope_bytes: bytes, k_temp: bytes) -> bytes:
-    """Used by the cloud dispatcher at the microsecond plaintext window (§4.2)."""
+    """Used by the cloud dispatcher, which keeps the decrypted bytes for the
+    duration of the Resend HTTP call."""
     if len(k_temp) != 32:
         raise ValueError(f"K_temp must be 32 bytes, got {len(k_temp)}")
     envelope = json.loads(envelope_bytes)
@@ -134,7 +133,7 @@ def decrypt_with_temp(envelope_bytes: bytes, k_temp: bytes) -> bytes:
     return AESGCM(k_temp).decrypt(nonce, ct, associated_data=None)
 
 
-# K_temp minting (terminal side, §2.3)
+# K_temp minting (terminal side, section 2.3)
 
 def mint_k_temp() -> bytes:
     """Generate a fresh K_temp. Terminal does this; cloud receives it."""

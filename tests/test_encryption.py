@@ -1,6 +1,6 @@
 """Tests for encryption layer - both modes round-trip + tamper detection.
 
-Spec sections covered: §2.2 (encryption modes), §2.3 (K_temp), §10.5 (corrupted pack).
+Spec sections covered: section 2.2 (encryption modes), section 2.3 (K_temp), section 10.5 (corrupted pack).
 """
 import importlib.util
 from pathlib import Path
@@ -33,7 +33,7 @@ def keypairs():
     return (nacl.public.PrivateKey.generate(), nacl.public.PrivateKey.generate())
 
 
-# §2.2 K_op+K_cl round-trip
+# section 2.2 K_op+K_cl round-trip
 
 def test_op_can_encrypt_and_decrypt(term_enc, keypairs):
     op_priv, cl_priv = keypairs
@@ -73,7 +73,7 @@ def test_wrong_keypair_cannot_decrypt(term_enc, keypairs):
         term_enc.decrypt_for_both(env, wrong_bundle)
 
 
-# §2.3 K_temp round-trip
+# section 2.3 K_temp round-trip
 
 def test_k_temp_round_trip(term_enc):
     k = term_enc.mint_k_temp()
@@ -101,7 +101,7 @@ def test_k_temp_id_deterministic(term_enc):
     assert len(term_enc.k_temp_id(k)) == 8
 
 
-# Cross-side: cloud encrypt -> terminal decrypt (§4.3)
+# Cross-side: cloud encrypt -> terminal decrypt (section 4.3)
 
 def test_cloud_encrypts_terminals_decrypt(tmp_cloud_dynamo, term_enc, keypairs):
     """Webhook flow: cloud encrypts to both pubkeys; either terminal decrypts."""

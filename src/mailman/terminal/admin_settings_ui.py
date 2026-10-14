@@ -76,7 +76,7 @@ th{{background:#f7f7f7;width:30%}}</style>
 <tr><th>Key</th><td><code>{_h.escape(key)}</code></td></tr>
 <tr><th>Decrypted value</th><td><code style='word-break:break-all'>{_h.escape(v or '(empty)')}</code></td></tr>
 </table>
-<p><a href='/admin/suppression'>← back to Suppression</a></p>
+<p><a href='/admin/suppression'>\u2190 back to Suppression</a></p>
 """
     return HTMLResponse(html)
 

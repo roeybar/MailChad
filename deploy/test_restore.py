@@ -67,7 +67,7 @@ try:
     else:
         print("WARNING: no keys.tar.enc in backup")
 
-    print("\n✓ RESTORE TEST PASSED - backup is valid and decryptable")
+    print("\n\u2713 RESTORE TEST PASSED - backup is valid and decryptable")
 
 finally:
     shutil.rmtree(tmp)

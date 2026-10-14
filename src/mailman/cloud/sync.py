@@ -1,7 +1,7 @@
-"""Sync API endpoints - cloud side (spec §3, §6).
+"""Sync API endpoints - cloud side (spec section 3, section 6).
 
 Short-poll GET /sync/pull, POST /sync/push, K_temp management, near-conflict
-detection. All endpoints require bearer auth (§6) except /init/handshake
+detection. All endpoints require bearer auth (section 6) except /init/handshake
 which uses a bootstrap token.
 """
 from __future__ import annotations
@@ -73,7 +73,7 @@ async def sync_pull(
 # /sync/push (POST)
 
 class SyncEventIn(BaseModel):
-    """Wire format per spec §3.1."""
+    """Wire format per spec section 3.1."""
     table:             str
     id:                str = Field(..., alias="row_id")  # accept "id" too via alias
     revision:          int
@@ -93,7 +93,7 @@ async def sync_push(
     events: list[dict],   # accept loose shape; we'll normalise
     actor: str = Depends(require_bearer),
 ):
-    """Store new events. Each gets a fresh event_id. Detects near-conflicts (§3.5)
+    """Store new events. Each gets a fresh event_id. Detects near-conflicts
     against the most recent prior write to the same (table, row_id).
 
     Returns: {"accepted": N, "assigned_event_ids": [...], "near_conflicts": [...]}
@@ -153,7 +153,7 @@ async def sync_push(
     }
 
 
-# K_temp lifecycle endpoints (§2.3)
+# K_temp lifecycle endpoints (section 2.3)
 
 class KTempIn(BaseModel):
     k_temp_b64:  str       # base64-encoded 32 bytes
@@ -188,7 +188,7 @@ async def key_temp_revoke(actor: str = Depends(require_bearer)):
     return {"revoked": True}
 
 
-# Near-conflict review (§3.5)
+# Near-conflict review
 
 @router.get("/sync/near-conflicts")
 async def near_conflicts_list(

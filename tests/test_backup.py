@@ -1,4 +1,4 @@
-"""Stress tests + hardener validation for bin/_backup.py.
+"""Stress tests + hardener validation for scripts/_backup.py.
 
 Run inside the terminal container:
     docker exec ep-v3-terminal python -m pytest /app/tests/test_backup.py -v
@@ -505,14 +505,14 @@ def test_derive_key_very_long_passphrase():
 
 
 def test_derive_key_special_characters():
-    pw = "pässwørd!@#$%^&*()_+-=[]{}|;':\",./<>?🔑"
+    pw = "p\u00E4ssw\u00F8rd!@#$%^&*()_+-=[]{}|;':\",./<>?\U0001F511"
     salt = os.urandom(16)
     k = bk.derive_key(pw, salt)
     assert len(k) == 32
 
 
 def test_derive_key_unicode():
-    pw = "密码测试パスワード"
+    pw = "\u5BC6\u7801\u6D4B\u8BD5\u30D1\u30B9\u30EF\u30FC\u30C9"
     salt = os.urandom(16)
     k = bk.derive_key(pw, salt)
     assert len(k) == 32

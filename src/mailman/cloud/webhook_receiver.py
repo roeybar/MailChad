@@ -1,4 +1,4 @@
-"""Resend webhook receiver - v3.1 (cloud-side, §4.3 + §13.6).
+"""Resend webhook receiver - v3.1 (cloud-side, section 4.3).
 
 Differences from v3.0:
 - Encrypts each webhook event to BOTH K_op_pub AND K_cl_pub (so either

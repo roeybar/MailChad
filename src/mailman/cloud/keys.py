@@ -1,6 +1,6 @@
-"""K_temp lifecycle - cloud side (§2.3, §13 step 3).
+"""K_temp lifecycle - cloud side (section 2.3).
 
-Cloud is the time-bounded oracle. It holds K_temp for TTL seconds, can decrypt
+Cloud is the time-bounded decryptor. It holds K_temp for TTL seconds, can decrypt
 packs during that window via terminal/app/encryption.py:decrypt_with_temp, and
 wipes K_temp on TTL expiry.
 

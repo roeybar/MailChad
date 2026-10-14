@@ -1,4 +1,4 @@
-"""Tests for K_temp lifecycle on cloud - spec §2.3, §10.2."""
+"""Tests for K_temp lifecycle on cloud - spec section 2.3, section 10.2."""
 import importlib.util
 from pathlib import Path
 

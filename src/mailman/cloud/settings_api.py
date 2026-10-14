@@ -1,4 +1,4 @@
-"""Cloud settings REST API - bearer-protected (§Q1 Phase B).
+"""Cloud settings REST API - bearer-protected (section 12).
 
 Terminal's admin UI calls these to read/write cloud-side settings remotely.
 All routes require a valid terminal bearer (registered at handshake).

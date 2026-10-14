@@ -1,4 +1,4 @@
-"""Email cleaner gate - unit tests. Pure (no network; MX off)."""
+"""Tests for normalising and validating addresses and dropping duplicates and invalid entries. No network; MX off."""
 from __future__ import annotations
 
 from mailman.terminal import email_clean as ec

@@ -1,7 +1,5 @@
 """HMAC-signed tokens for public unsubscribe + GDPR erasure links.
 
-Ported from coherence/backend/auth/app/compliance_tokens.py.
-
 Two distinct secrets - UNSUB_SECRET and ERASURE_SECRET - so a leaked
 unsubscribe link can't be repurposed for mass deletion.
 

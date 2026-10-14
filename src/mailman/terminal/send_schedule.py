@@ -3,7 +3,7 @@
 Compiles a list of N recipients into N `send_at` UTC timestamps spread across
 daily work-hours windows, by `sender_count` parallel send cursors, with an
 end-of-window rush (denser sends in the last `rush_tail_minutes`). The terminal
-emits these on the packs; the cloud dispatcher fires each when due (§4.2). The
+emits these on the packs; the cloud dispatcher fires each when due (section 4.2). The
 terminal is not involved during sending - the schedule lives entirely in send_at.
 
 Pure function (seedable) so it's unit-testable without a clock.

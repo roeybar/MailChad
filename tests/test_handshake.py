@@ -1,4 +1,4 @@
-"""Tests for init handshake endpoint - §7, §13.7."""
+"""Tests for init handshake endpoint - section 7."""
 import base64
 import importlib.util
 import sys

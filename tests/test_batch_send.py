@@ -40,7 +40,7 @@ def test_sorted_and_count():
 
 def test_multi_day_spread():
     start = datetime(2026, 6, 22, 0, 0, tzinfo=UTC)
-    # 3 senders, ~600/day -> 2000 needs ≥3 days
+    # 3 senders, ~600/day -> 2000 needs >=3 days
     ats = ss.compute_send_ats(2000, start, seed=3)
     days = {_to_pt(a).date() for a in ats}
     assert len(days) >= 3, f"expected multi-day spread, got {len(days)} day(s)"
