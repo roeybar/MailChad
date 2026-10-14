@@ -3285,7 +3285,7 @@ def seeds_view(session=Depends(require_session)):
 
 <div class="card pad mb">
   <div class="row" style="gap:8px;flex-wrap:wrap;align-items:center">
-    <input id="seedEmail" class="input" placeholder="seed@gmail.com" style="max-width:280px">
+    <input id="seedEmail" class="input" placeholder="seed@inbox.example" style="max-width:280px">
     <input id="seedProvider" class="input" placeholder="provider (gmail, outlook\u2026)" style="max-width:200px">
     <button class="btn" onclick="addSeed()">Add seed</button>
   </div>
@@ -3967,7 +3967,7 @@ def operators_view(session=Depends(require_session)):
                  help="Default: 43200 (12 hours). Cookie-based session lifetime.")
 )}
 {_config_block("Change admin password", """
-<p style='font-size:.9em;color:#555;margin:.3em 0 1em'>Changes take effect immediately. You will remain signed in.</p>
+<p style='font-size:.9em;color:#555;margin:.3em 0 1em'>This changes the fallback admin password only; each operator account keeps its own password. You will remain signed in.</p>
 <form method='post' action='/admin/settings/auth/password' style='max-width:380px;margin:0'>
   <label style='display:block;margin:.4em 0 .2em;font-size:.9em'>New password (\u2265 12 chars)
     <input type='password' name='new_password' required minlength='12'
@@ -4050,9 +4050,8 @@ Suppressed addresses are skipped automatically during import.
 """),
     ("Contact segmentation", "segment tag filter campaign recipients by-tag bulk add", """
 On the Campaign Recipients page, use <b>Add by tag</b> to bulk-add all contacts matching a tag token.
-The tag filter on the Contacts page (search box) also narrows the list.
-<code>GET /admin/contacts/count?tag=X</code> returns the match count before adding.
-Tags are matched with an exact prefix - <code>beta</code> matches contacts tagged <code>beta</code> or <code>beta|vip</code>.
+Add by tag matches exact tag names in the pipe-separated list, at any position.
+The contacts search and the count endpoint match substrings, so their totals can be higher than the number added.
 """),
     ("Templates &amp; preview", "template html subject from-name variable substitution preview render", """
 Templates use double-brace variables: <code>{{name}}</code>, <code>{{email}}</code>, <code>{{firstName}}</code>, <code>{{companyName}}</code>, <code>{{unsubscribeUrl}}</code>, <code>{{erasureUrl}}</code>.
@@ -4071,7 +4070,7 @@ The <b>K_temp TTL</b> setting (Overview page \u2699 Config) controls how long pa
 """),
     ("Campaign analytics", "analytics opened clicked bounced complained stats rates", """
 After dispatch, click <b>Analytics</b> on any campaign to see delivery stats.
-Summary row: Sent / Clicked / Bounced / Failed with counts and rates. Open tracking is off.
+Summary row: Sent / Clicked / Bounced / Complained / Failed with counts and rates, plus rate limit and bounce threshold. Open tracking is off.
 Per-recipient table shows individual status, timestamps, and message IDs.
 Stats are populated by the inbox materialiser - Resend webhook events are synced from the cloud,
 decrypted, and applied to <code>campaign_recipients</code> every 10 seconds.
@@ -4122,7 +4121,8 @@ Old <code>/admin/settings/*</code> URLs redirect to the new locations.
 """),
     ("Sync protocol", "sync pull push cursor bearer token encryption", """
 The terminal short-polls <code>GET /sync/pull?since=N</code> every 5 seconds.
-Webhook and suppression payloads use AES-256-GCM with a per-payload key wrapped via NaCl SealedBox to both terminals' public keys. Each terminal decrypts its wrap with its own private key.
+Webhook events and suppressions derived from them are encrypted to both terminals' public keys. One-click unsubscribe suppressions are stored and synced as SHA-256 email hashes.
+Webhook event payloads use AES-256-GCM with a per-payload key wrapped via NaCl SealedBox. Each terminal decrypts its wrap with its own private key.
 The sync cursor advances monotonically; missed events are replayed on reconnect.
 Push path: terminal <code>POST /sync/push</code> -> cloud stores event -> Lambda reads on next pull.
 Bearer token is stored in <code>KEYS_DIR/cloud_bearer.txt</code> after handshake.
@@ -4131,7 +4131,7 @@ Bearer token is stored in <code>KEYS_DIR/cloud_bearer.txt</code> after handshake
 Webhook events from Resend are synced from the cloud,
 decrypted, and applied to <code>campaign_recipients</code> every 10 seconds by the materialiser loop.
 Opened events are ignored; open tracking is off.
-Suppression events (unsubscribe hash synced from cloud) are also applied here.
+Encrypted suppression events are materialised here; one-click unsubscribe hashes are merged directly by the pull loop.
 If the KeyBundle is not yet ready (handshake not run), materialisation is skipped and retried next tick.
 Check <code>GET /sync/status</code> for pending inbox event counts.
 """),

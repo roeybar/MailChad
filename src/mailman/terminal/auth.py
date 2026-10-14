@@ -4,10 +4,9 @@ Single-operator model. Email + bcrypt-hashed
 password in env, JWT cookie session.
 
 ADMIN_EMAIL: plaintext email/handle
-ADMIN_PASSWORD_HASH: bcrypt hash (helper: scripts/v3 admin-bcrypt; see Known limitations in the README)
+ADMIN_PASSWORD_HASH: bcrypt hash (helper: scripts/v3 admin-bcrypt)
 JWT_SECRET: base64-48
 
-Ported in spirit from email-platform/src/lib/auth/.
 """
 from __future__ import annotations
 
