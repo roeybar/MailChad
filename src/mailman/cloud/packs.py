@@ -1,4 +1,4 @@
-"""Pack API - cloud side (§4).
+"""Pack API - cloud side (section 4).
 
 Terminals POST encrypted packs to /packs. On receipt the pack is stored in
 DynamoDB and a {"pack_id": "<id>"} message is enqueued to SQS. The
@@ -70,14 +70,16 @@ async def packs_push(packs: list[PackIn], actor: str = Depends(require_bearer)):
 
     A pack already due (send_at <= now) is enqueued to SQS immediately. A pack
     with a future send_at is left `pending` in DynamoDB - the EventBridge-driven
-    dispatcher sweep (list_pending_packs via the status/send_at GSI, §4.2) feeds it
+    dispatcher sweep (list_pending_packs via the status/send_at GSI, section 4.2) feeds it
     to SQS when it comes due. This is what lets the cloud hold thousands of delayed
     sends and fire each when scheduled, with the terminal uninvolved after push.
+    A pack id already stored is skipped and listed under `held` with its current status, so a terminal retrying a push can record what the cloud already holds.
     """
     now = _now_iso()
     inserted = 0
     enqueued = 0
     deferred = 0
+    held = []
     for p in packs:
         try:
             dynamo.put_pack(
@@ -94,30 +96,46 @@ async def packs_push(packs: list[PackIn], actor: str = Depends(require_bearer)):
                 deferred += 1            # sweep will enqueue when due
             inserted += 1
         except dynamo.PackAlreadyExists:
+            cur = dynamo.get_pack(p.pack_id)
+            if cur is not None:
+                held.append({"pack_id": cur["pack_id"], "status": cur["status"],
+                             "resend_message_id": cur["resend_message_id"],
+                             "failure_reason": cur["failure_reason"]})
             continue
     return {"accepted": inserted, "submitted": len(packs),
-            "enqueued": enqueued, "deferred": deferred}
+            "enqueued": enqueued, "deferred": deferred, "held": held}
 
 
 @router.get("/packs/status")
 async def packs_status(since_id: str = "", limit: int = 500,
                         actor: str = Depends(require_bearer)):
-    """Terminals pull dispatch results so they can update local campaign_recipients."""
-    rows = dynamo.list_resolved_packs(since_enqueued_at=since_id, limit=limit)
+    """Terminals pull dispatch results so they can update local campaign_recipients.
+    since_id/max_id are the outcome cursor (dynamo.outcome_cursor); the newest
+    RESOLVED_SETTLE_S seconds wait for the next poll."""
+    rows = dynamo.list_resolved_packs(since_enqueued_at=since_id, limit=limit,
+                                      settle_s=dynamo.RESOLVED_SETTLE_S)
     return {"packs": rows, "count": len(rows),
-            "max_id": rows[-1]["enqueued_at"] if rows else since_id}
+            "max_id": dynamo.outcome_cursor(rows[-1]) if rows else since_id}
 
 
 @router.delete("/packs/{pack_id}")
 async def packs_cancel(pack_id: str, actor: str = Depends(require_bearer)):
-    """Cancel a pending pack. No-op if claimed/sent/failed."""
+    """Cancel a pending pack. No-op if claimed/sent/failed. The write is conditional on 'pending',
+    so a dispatcher claim between a read and the write cannot be overwritten."""
+    if dynamo.cancel_pack(pack_id):
+        return {"cancelled": True}
     pack = dynamo.get_pack(pack_id)
     if not pack:
         raise HTTPException(404, "no such pack")
-    if pack["status"] != "pending":
-        return {"cancelled": False, "reason": f"already {pack['status']}"}
-    dynamo.update_pack(pack_id, status="cancelled", encrypted_payload=None)
-    return {"cancelled": True}
+    if pack["status"] == "pending":
+        if dynamo.cancel_pack(pack_id):
+            return {"cancelled": True}
+        pack = dynamo.get_pack(pack_id)
+        if not pack:
+            raise HTTPException(404, "no such pack")
+        if pack["status"] == "pending":
+            return {"cancelled": False, "reason": "cancel not confirmed"}
+    return {"cancelled": False, "reason": f"already {pack['status']}"}
 
 
 @router.post("/packs/cancel-campaign")

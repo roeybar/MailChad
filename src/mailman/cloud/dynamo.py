@@ -15,7 +15,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import boto3
@@ -484,8 +484,8 @@ def claim_pack(pack_id: str) -> bool:
 
 
 def update_pack(pack_id: str, **fields) -> None:
-    """Generic update for pack fields (status, sent_at, resend_message_id, etc.)."""
-    if not fields:
+    """Generic update for pack fields. A resolving status also stamps resolved_at."""
+    if not (fields := _stamp_resolved(fields)):
         return
     set_expr = ", ".join(f"#{k} = :{k}" for k in fields)
     names = {f"#{k}": k for k in fields}
@@ -516,7 +516,12 @@ def cancel_pending_for_campaign(campaign_id: int) -> int:
     """Cancel ALL still-pending packs for a campaign (any send_at), including seed
     packs that have no terminal-side dispatched_job row. Returns count cancelled.
     This is the correct way to abort a campaign - deleting only dispatched_job
-    pack_ids misses salted seed packs and leaves them to fire."""
+    pack_ids misses salted seed packs and leaves them to fire.
+
+    Each cancel is conditional on status 'pending' (cancel_pack). The status-index
+    GSI is eventually consistent, so a listed pack may already be claimed or sent;
+    such a pack is left untouched and not counted. A pack written just before this
+    call may be missing from the GSI and is not cancelled."""
     table = _get_table()
     cancelled = 0
     kwargs = {
@@ -527,14 +532,9 @@ def cancel_pending_for_campaign(campaign_id: int) -> int:
     while True:
         resp = table.query(**kwargs)
         for it in resp.get("Items", []):
-            pid = it["pack_id"]
-            table.update_item(
-                Key={"pk": f"PACK#{pid}", "sk": f"PACK#{pid}"},
-                UpdateExpression="SET #s = :c, encrypted_payload = :n",
-                ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={":c": "cancelled", ":n": None},
-            )
-            cancelled += 1
+            # Conditional: the GSI can lag, so a pack claimed or sent since this read is left alone and not counted.
+            if cancel_pack(it["pack_id"]):
+                cancelled += 1
         lek = resp.get("LastEvaluatedKey")
         if not lek:
             break
@@ -542,27 +542,26 @@ def cancel_pending_for_campaign(campaign_id: int) -> int:
     return cancelled
 
 
-def list_resolved_packs(since_enqueued_at: str = "", limit: int = 500) -> list[dict]:
-    """Return packs in terminal statuses (sent/failed/stuck_no_key/cancelled)
-    with enqueued_at > since_enqueued_at, oldest-first.
+def list_resolved_packs(since_enqueued_at: str = "", limit: int = 500, *, settle_s: int = 0) -> list[dict]:
+    """Return resolved packs (RESOLVED_PACK_STATUSES) after the cursor, in outcome order (_outcome_key).
 
-    The status-index GSI sorts by send_at (which is '1970…' for immediate sends),
-    so it can't range-key on enqueued_at. We filter enqueued_at via a
-    FilterExpression and paginate forward so the cursor always advances - without
-    this the terminal's outcomes loop freezes on the oldest page and never sees
-    new packs. (Scale follow-up: add a GSI keyed on enqueued_at to avoid the
-    full-partition read this filter implies.)"""
-    resolved_statuses = {"sent", "failed", "stuck_no_key", "cancelled"}
+    The cursor is what packs_status returned: "<time>#<pack_id>", or a bare time from before the cursor change,
+    which keeps its old meaning (outcome time > cursor). Outcome time is resolved_at, stamped on every
+    resolve, so a pack that resolves late is still returned; rows resolved before the cursor change use enqueued_at.
+    settle_s > 0 holds back the newest seconds, so a write still landing in them is not passed over.
+    (Each status partition is read in full under a FilterExpression.)"""
+    since_t, sep, since_pid = since_enqueued_at.partition("#")
+    upper = _iso_ago(settle_s) if settle_s > 0 else None
     rows = []
     work_cap = max(limit * 4, 2000)
-    for status in resolved_statuses:
+    for status in RESOLVED_PACK_STATUSES:
         kwargs = {
             "IndexName": "status-index",
             "KeyConditionExpression": Key("status").eq(status),
             "ScanIndexForward": True,
         }
-        if since_enqueued_at:
-            kwargs["FilterExpression"] = Attr("enqueued_at").gt(since_enqueued_at)
+        if since_t:
+            kwargs["FilterExpression"] = Attr("resolved_at").gte(since_t) | Attr("enqueued_at").gte(since_t)
         scanned = 0
         while True:
             resp = _get_table().query(**kwargs)
@@ -572,7 +571,8 @@ def list_resolved_packs(since_enqueued_at: str = "", limit: int = 500) -> list[d
             if not lek or scanned >= work_cap:
                 break
             kwargs["ExclusiveStartKey"] = lek
-    rows.sort(key=lambda r: r["enqueued_at"])
+    rows = [r for r in rows if _after_cursor(_outcome_key(r), since_t, since_pid if sep else None, upper)]
+    rows.sort(key=_outcome_key)
     return rows[:limit]
 
 
@@ -592,7 +592,7 @@ def _coerce_pack(item: dict) -> dict:
         "claimed_at":       item.get("claimed_at"),
         "sent_at":          item.get("sent_at"),
         "resend_message_id": item.get("resend_message_id"),
-        "failure_reason":   item.get("failure_reason"),
+        "failure_reason":   item.get("failure_reason"), "resolved_at": item.get("resolved_at"),
     }
 
 
@@ -754,3 +754,102 @@ def list_unsubs(since_cursor: str = "", limit: int = 1000) -> list[dict]:
             "cursor":     it["sk"],
         })
     return out
+
+
+# pack cancel
+
+def cancel_pack(pack_id: str) -> bool:
+    """Atomically flip status pending -> cancelled and drop the payload. Returns True on success.
+    Returns False, and leaves the pack untouched, when it is missing or no longer pending
+    (a dispatcher claimed it, or it already resolved)."""
+    try:
+        _get_table().update_item(
+            Key={"pk": f"PACK#{pack_id}", "sk": f"PACK#{pack_id}"},
+            UpdateExpression="SET #s = :c, encrypted_payload = :n, resolved_at = :now",
+            ConditionExpression=Attr("status").eq("pending"),
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":c": "cancelled", ":n": None, ":now": _now()},
+        )
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
+# send outcome unknown, and the outcome cursor
+
+RESOLVED_PACK_STATUSES = ("sent", "failed", "stuck_no_key", "cancelled", "unknown")
+RESOLVED_SETTLE_S = 10   # packs_status holds back the newest seconds, so a resolve still landing in them (or GSI lag) is not passed over
+STALE_CLAIM_REASON = "dispatcher stopped after claiming it at {claimed_at}"
+
+
+def _iso_ago(seconds: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _stamp_resolved(fields: dict) -> dict:
+    """A write that resolves a pack also stamps resolved_at, the outcome cursor's time, unless the caller set it."""
+    if fields.get("status") in RESOLVED_PACK_STATUSES and "resolved_at" not in fields:
+        return {**fields, "resolved_at": _now()}
+    return fields
+
+
+def _outcome_key(row: dict) -> tuple[str, str]:
+    """Outcome order: resolved_at, or enqueued_at for a pack resolved before resolved_at existed; pack_id breaks ties."""
+    return (row.get("resolved_at") or row["enqueued_at"], row["pack_id"])
+
+
+def outcome_cursor(row: dict) -> str:
+    """The cursor packs_status returns after `row`: "<time>#<pack_id>"."""
+    return "#".join(_outcome_key(row))
+
+
+def _after_cursor(key: tuple[str, str], since_t: str, since_pid: str | None, upper: str | None) -> bool:
+    """True when an outcome key is past the cursor and not held back by the settle bound. A bare
+    cursor without "#" (the older format) compares the time alone, strictly."""
+    if upper is not None and key[0] > upper:
+        return False
+    if not since_t:
+        return True
+    if since_pid is None:
+        return key[0] > since_t
+    return key > (since_t, since_pid)
+
+
+def expire_stale_claims(older_than_s: int, *, limit: int = 200) -> int:
+    """A pack still 'claimed' older_than_s after its claim (the dispatcher crashed, timed out, or failed
+    to record a send) becomes 'unknown' with a reason, and its payload is dropped. It is never re-sent:
+    the provider may have it, and the send carries no idempotency key. The write is
+    conditional on the same claim, so a pack finished meanwhile is left alone. Returns the count."""
+    table = _get_table()
+    kwargs = {
+        "IndexName": "status-index",
+        "KeyConditionExpression": Key("status").eq("claimed"),
+        "FilterExpression": Attr("claimed_at").lte(_iso_ago(older_than_s)),
+    }
+    changed = 0
+    while changed < limit:
+        resp = table.query(**kwargs)
+        for it in resp.get("Items", []):
+            if changed >= limit:
+                break
+            try:
+                table.update_item(
+                    Key={"pk": f"PACK#{it['pack_id']}", "sk": f"PACK#{it['pack_id']}"},
+                    UpdateExpression="SET #s = :u, failure_reason = :r, encrypted_payload = :n, resolved_at = :now",
+                    ConditionExpression=Attr("status").eq("claimed") & Attr("claimed_at").eq(it["claimed_at"]),
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={":u": "unknown",
+                                               ":r": STALE_CLAIM_REASON.format(claimed_at=it["claimed_at"]),
+                                               ":n": None, ":now": _now()},
+                )
+                changed += 1
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                    raise
+        lek = resp.get("LastEvaluatedKey")
+        if not lek:
+            break
+        kwargs["ExclusiveStartKey"] = lek
+    return changed

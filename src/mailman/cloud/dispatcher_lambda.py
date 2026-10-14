@@ -1,4 +1,4 @@
-"""ep-dispatcher Lambda handler - SQS consumer (spec §4.2 + Phase 3).
+"""ep-dispatcher Lambda handler - SQS consumer (spec section 4.2).
 
 Each SQS record body: {"pack_id": "<uuid>"}
 
@@ -48,7 +48,7 @@ def _enqueue(pack_id: str) -> bool:
 
 def _sweep() -> dict:
     """EventBridge-driven: find packs now due (send_at <= now, status=pending) via
-    the status/send_at GSI and feed them to SQS. This is the timed feed §4.2 always
+    the status/send_at GSI and feed them to SQS. This is the timed feed section 4.2 always
     specified - it lets the cloud hold thousands of delayed sends and fire each when
     due, with the terminal uninvolved. Idempotent: claim/status guards in _process
     make a double-enqueue a no-op."""
@@ -56,7 +56,7 @@ def _sweep() -> dict:
     due = dynamo.list_pending_packs(limit=SWEEP_LIMIT)
     n = sum(1 for p in due if _enqueue(p["pack_id"]))
     log.info("sweep: %d due pack(s) enqueued", n)
-    return {"swept": len(due), "enqueued": n}
+    return {"swept": len(due), "enqueued": n, "stale_unknown": _expire_stale_claims()}
 
 # In-memory bounce tracker: {campaign_id: {"sent": N, "bounced": N, "delay_s": X}}
 # Shared within a process (local dispatcher). Lambda resets per invocation - acceptable.
@@ -170,7 +170,7 @@ def _process(pack_id: str) -> tuple[str, float]:
 
     _finalize(pack_id, status, msg_id, failure)
     _update_campaign_stats(campaign_id, bounced=(status == "failed"))
-
+    _stop_if_unknown(pack_id, status, failure)
     delay = _compute_delay(rate_per_min, bounce_pause_pct, campaign_id,
                            human_send, human_min, human_max)
     return "processed", delay, human_count
@@ -189,7 +189,7 @@ def _compute_delay(rate_per_min: int | None, bounce_pause_pct: float, campaign_i
                    human_send: bool = False, human_min: int = 60, human_max: int = 210) -> float:
     if human_send:
         base = random.uniform(human_min, human_max)
-        log.debug("human-send delay: %.1fs (range %s–%ss)", base, human_min, human_max)
+        log.debug("human-send delay: %.1fs (range %s\u2013%ss)", base, human_min, human_max)
     elif rate_per_min:
         base = 60.0 / rate_per_min
     else:
@@ -200,7 +200,7 @@ def _compute_delay(rate_per_min: int | None, bounce_pause_pct: float, campaign_i
         sent = s.get("sent", 0)
         bounced = s.get("bounced", 0)
         if sent > 10 and bounced / sent >= bounce_pause_pct:
-            log.warning("campaign %s: bounce rate %.1f%% ≥ threshold %.1f%% - emergency rate halving",
+            log.warning("campaign %s: bounce rate %.1f%% \u2265 threshold %.1f%% - emergency rate halving",
                         campaign_id, bounced / sent * 100, bounce_pause_pct * 100)
             base = max(base, 1.0) * 2
     return base
@@ -231,11 +231,11 @@ def _send_sync(plain: dict) -> tuple[str, str | None, str | None]:
                        headers={"Authorization": f"Bearer {api_key}"},
                        timeout=30)
     except Exception as e:
-        # Network error - let SQS retry (raise so visibility timeout resets)
-        raise RuntimeError(f"network: {e}") from e
+        # the request may have reached Resend, and the send has no idempotency key: reported 'unknown', never retried.
+        return "unknown", None, f"network error during send ({type(e).__name__})"
 
-    if r.status_code >= 500:
-        raise RuntimeError(f"resend {r.status_code} - will retry")
+    if r.status_code >= 500:   # Resend may have accepted it before failing: 'unknown', never retried
+        return "unknown", None, f"resend {r.status_code} during send"
 
     try:
         j = r.json()
@@ -265,3 +265,33 @@ def _finalize(pack_id: str, status: str, msg_id: str | None, failure: str | None
             encrypted_payload=None, deleted=False,
         )
     log.info("pack %s -> %s (msg_id=%s)", pack_id, status, msg_id)
+
+
+# a send whose outcome is unknown
+
+CLAIM_STALE_S = int(os.environ.get("CLAIM_STALE_S", "900"))
+
+
+class SendOutcomeUnknown(RuntimeError):
+    """The Resend call failed in a way that leaves delivery unknown; the pack is now 'unknown'."""
+
+
+def _stop_if_unknown(pack_id: str, status: str, failure: str | None) -> None:
+    """After an 'unknown' send, stop this invocation: the rest of the batch is redelivered while still
+    pending instead of meeting the same outage, and this pack, no longer pending, is skipped then."""
+    if status == "unknown":
+        raise SendOutcomeUnknown(f"pack {pack_id}: send outcome unknown ({failure}); batch stopped")
+
+
+def _expire_stale_claims() -> int:
+    """Sweep backstop: packs left 'claimed' CLAIM_STALE_S or longer become 'unknown' (dynamo.expire_stale_claims).
+    A failure here is logged and never blocks the due-pack feed."""
+    from mailman.cloud import dynamo
+    try:
+        n = dynamo.expire_stale_claims(CLAIM_STALE_S, limit=SWEEP_LIMIT)
+    except Exception as e:
+        log.warning("sweep: stale-claim check failed: %s", e)
+        return 0
+    if n:
+        log.warning("sweep: %d pack(s) claimed %ss or longer ago marked unknown", n, CLAIM_STALE_S)
+    return n
