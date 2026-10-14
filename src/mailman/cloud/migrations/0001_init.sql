@@ -1,6 +1,6 @@
 -- v3.1 cloud schema - dumb storage + execution loop.
 --
--- Per spec §1: cloud holds only what the sync protocol moves through it.
+-- Per spec section 1: cloud holds only what the sync protocol moves through it.
 -- Cannot decrypt K_op+K_cl payloads (no private keys). Can decrypt K_temp
 -- payloads during TTL (key on filesystem via cloud/app/keys.py).
 
@@ -8,7 +8,7 @@ PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
 
 -- event_log
--- The sync wire (§3.1). Every write from a terminal becomes a row here.
+-- The sync wire (section 3.1). Every write from a terminal becomes a row here.
 CREATE TABLE IF NOT EXISTS event_log (
   event_id          INTEGER PRIMARY KEY AUTOINCREMENT,
   table_name        TEXT    NOT NULL,
