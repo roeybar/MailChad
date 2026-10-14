@@ -2,7 +2,7 @@
 ALTER TABLE companies RENAME TO entities;
 ALTER TABLE campaigns RENAME COLUMN company_id TO entity_id;
 
--- CAN-SPAM §5 requires physical mailing address in every commercial email footer
+-- CAN-SPAM section 5 requires physical mailing address in every commercial email footer
 ALTER TABLE entities ADD COLUMN footer_address TEXT DEFAULT NULL;
 -- Support contact (optional but shown in compliance UI)
 ALTER TABLE entities ADD COLUMN support_email  TEXT DEFAULT NULL;

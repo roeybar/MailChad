@@ -1,4 +1,4 @@
-"""Vault ↔ front-edge sync orchestrator.
+"""Vault <-> front-edge sync orchestrator.
 
 Called on every vault wake. Pulls front-edge's caches, merges into vault's
 source-of-truth tables, then acks back so front-edge can GC.
@@ -21,8 +21,10 @@ import os
 from datetime import datetime, timezone
 
 import httpx
+from sqlalchemy import func, insert, select, update
 
 from mailman.terminal import db
+from mailman.terminal.models import CampaignRecipient, DispatchedJob, DriftReport, Event, SuppressionHash
 
 log = logging.getLogger("vault.sync")
 
@@ -42,7 +44,7 @@ EVENT_STATUS_MAP = {
 }
 
 
-def _apply_event_to_recipient(c, event_type: str, message_id: str | None, recipient: str | None) -> None:
+def _apply_event_to_recipient(s, event_type: str, message_id: str | None, recipient: str | None) -> None:
     """If we can map this to a campaign_recipients row, update its status."""
     if not message_id:
         return
@@ -55,39 +57,43 @@ def _apply_event_to_recipient(c, event_type: str, message_id: str | None, recipi
     }.get(status)
     if not col:
         return
-    c.execute(
-        f"UPDATE campaign_recipients SET status=?, {col}=datetime('now') "
-        f"WHERE message_id=? AND status NOT IN ('bounced', 'complained', 'failed')",
-        (status, message_id),
+    s.execute(
+        update(CampaignRecipient)
+        .where(CampaignRecipient.message_id == message_id,
+               CampaignRecipient.status.not_in(("bounced", "complained", "failed")))
+        .values(**{"status": status, col: func.datetime("now")})
+        .execution_options(synchronize_session=False)
     )
 
 
 def _ingest_events(events: list[dict]) -> int:
     if not events:
         return 0
-    with db.conn() as c:
-        c.execute("BEGIN")
+    with db.session() as s:
+        db.begin_explicit(s)
         for e in events:
-            c.execute(
-                "INSERT INTO events (event_type, message_id, recipient, payload_json, synced_from_edge_at) "
-                "VALUES (?, ?, ?, ?, datetime('now'))",
-                (e["event_type"], e["message_id"], e["recipient"], e["payload_json"]),
+            s.execute(
+                insert(Event).values(event_type=e["event_type"], message_id=e["message_id"],
+                                     recipient=e["recipient"], payload_json=e["payload_json"],
+                                     synced_from_edge_at=func.datetime("now"))
+                .execution_options(synchronize_session=False)
             )
-            _apply_event_to_recipient(c, e["event_type"], e["message_id"], e["recipient"])
-        c.commit()
+            _apply_event_to_recipient(s, e["event_type"], e["message_id"], e["recipient"])
+        s.commit()
     return len(events)
 
 
 def _ingest_unsubs(unsubs: list[dict]) -> int:
     if not unsubs:
         return 0
-    with db.conn() as c:
+    with db.session() as s:
         for u in unsubs:
-            c.execute(
-                "INSERT OR IGNORE INTO suppression_hashes (email_hash, reason, source) VALUES (?, 'unsubscribe', ?)",
-                (u["email_hash"], u["source_token"]),
+            s.execute(
+                insert(SuppressionHash).prefix_with("OR IGNORE")
+                .values(email_hash=u["email_hash"], reason="unsubscribe", source=u["source_token"])
+                .execution_options(synchronize_session=False)
             )
-        c.commit()
+        s.commit()
     return len(unsubs)
 
 
@@ -96,12 +102,13 @@ def _ingest_erasures(erasures: list[dict]) -> tuple[int, list[int]]:
     if not erasures:
         return 0, []
     ack_ids = []
-    with db.conn() as c:
+    with db.session() as s:
         for e in erasures:
             # Erasure also implies suppression (don't email a deleted user).
-            c.execute(
-                "INSERT OR IGNORE INTO suppression_hashes (email_hash, reason, source) VALUES (?, 'erasure_request', ?)",
-                (e["email_hash"], e["source_token"]),
+            s.execute(
+                insert(SuppressionHash).prefix_with("OR IGNORE")
+                .values(email_hash=e["email_hash"], reason="erasure_request", source=e["source_token"])
+                .execution_options(synchronize_session=False)
             )
             # Audit the erasure request. Real deletion happens via the
             # erasure-propagation path (see propagate_erasure_to_backup).
@@ -112,7 +119,7 @@ def _ingest_erasures(erasures: list[dict]) -> tuple[int, list[int]]:
                 details={"source": e["source_token"]},
             )
             ack_ids.append(e["id"])
-        c.commit()
+        s.commit()
     return len(erasures), ack_ids
 
 
@@ -121,10 +128,11 @@ def _ingest_erasures(erasures: list[dict]) -> tuple[int, list[int]]:
 def _detect_drift(edge_queue: list[dict]) -> list[dict]:
     """Compare front-edge queue to vault.dispatched_job. Returns drift entries."""
     edge_by_id = {j["job_id"]: j for j in edge_queue}
-    with db.conn() as c:
-        vault_jobs = {r["job_id"]: dict(r) for r in c.execute(
-            "SELECT job_id, status, content_hash FROM dispatched_job WHERE status NOT IN ('completed', 'cancelled', 'failed')"
-        ).fetchall()}
+    with db.session() as s:
+        vault_jobs = {r["job_id"]: dict(r) for r in s.execute(
+            select(DispatchedJob.job_id, DispatchedJob.status, DispatchedJob.content_hash)
+            .where(DispatchedJob.status.not_in(("completed", "cancelled", "failed")))
+        ).mappings().all()}
 
     drift = []
 
@@ -176,14 +184,14 @@ def _detect_drift(edge_queue: list[dict]) -> list[dict]:
 def _persist_drift(drift: list[dict]) -> int:
     if not drift:
         return 0
-    with db.conn() as c:
+    with db.session() as s:
         for d in drift:
-            c.execute(
-                "INSERT INTO drift_report (category, severity, job_id, details_json) "
-                "VALUES (?, ?, ?, ?)",
-                (d["category"], d["severity"], d.get("job_id"), json.dumps(d["details"])),
+            s.execute(
+                insert(DriftReport).values(category=d["category"], severity=d["severity"], job_id=d.get("job_id"),
+                                           details_json=json.dumps(d["details"]))
+                .execution_options(synchronize_session=False)
             )
-        c.commit()
+        s.commit()
     return len(drift)
 
 
@@ -195,10 +203,10 @@ async def run_sync() -> dict:
     summary = {"events": 0, "unsubs": 0, "erasures": 0, "drift": 0, "drift_critical": 0}
 
     # Determine since_id for incremental event pull.
-    with db.conn() as c:
-        row = c.execute(
-            "SELECT max(id) AS last FROM events"
-        ).fetchone()
+    with db.session() as s:
+        row = s.execute(
+            select(func.max(Event.id).label("last"))
+        ).mappings().first()
     # NOTE: this is a simplification - proper since_id needs to be vault's
     # last-pulled cursor, not max event id. v3 leaves it as the simple
     # "pull everything you have, dedupe on svix_id" pattern; front-edge

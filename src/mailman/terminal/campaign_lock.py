@@ -14,11 +14,15 @@ overlap.
 """
 from __future__ import annotations
 
+from sqlalchemy import func, select, update
+from sqlalchemy.orm import aliased
+
 from mailman.terminal import db
+from mailman.terminal.models import Campaign, CampaignRecipient, SyncState
 
 
-def _last_pull_ok_at(c) -> str:
-    row = c.execute("SELECT value FROM sync_state WHERE key='last_pull_ok_at'").fetchone()
+def _last_pull_ok_at(s) -> str:
+    row = s.execute(select(SyncState.value).where(SyncState.key == "last_pull_ok_at")).mappings().first()
     return (row["value"] if row else "") or ""
 
 
@@ -29,19 +33,19 @@ def locked_contacts(exclude_campaign_id: int | None = None) -> dict[int, dict]:
     A recipient who has clicked (clicked_at set) is NOT locked.
     """
     out: dict[int, dict] = {}
-    with db.conn() as c:
-        rows = c.execute(
-            """
-            SELECT cr.contact_id, c.id AS campaign_id, c.name, c.lock_until
-            FROM campaign_recipients cr
-            JOIN campaigns c ON c.id = cr.campaign_id
-            WHERE c.dispatched_at IS NOT NULL
-              AND c.unsubs_confirmed_at IS NULL
-              AND c.lock_until IS NOT NULL
-              AND c.lock_until > datetime('now')
-              AND cr.clicked_at IS NULL
-            """,
-        ).fetchall()
+    with db.session() as s:
+        cr, c = aliased(CampaignRecipient), aliased(Campaign)
+        rows = s.execute(
+            select(cr.contact_id, c.id.label("campaign_id"), c.name, c.lock_until)
+            .join(c, c.id == cr.campaign_id)
+            .where(
+                c.dispatched_at.is_not(None),
+                c.unsubs_confirmed_at.is_(None),
+                c.lock_until.is_not(None),
+                c.lock_until > func.datetime("now"),
+                cr.clicked_at.is_(None),
+            )
+        ).mappings().all()
         for r in rows:
             if exclude_campaign_id is not None and r["campaign_id"] == exclude_campaign_id:
                 continue
@@ -72,26 +76,26 @@ def confirm_elapsed_locks() -> int:
     Called by the scheduler loop.
     """
     confirmed = 0
-    with db.conn() as c:
-        pull_ok_at = _last_pull_ok_at(c)
-        rows = c.execute(
-            """
-            SELECT id, dispatched_at FROM campaigns
-            WHERE dispatched_at IS NOT NULL
-              AND unsubs_confirmed_at IS NULL
-              AND lock_until IS NOT NULL
-              AND lock_until <= datetime('now')
-            """,
-        ).fetchall()
+    with db.session() as s:
+        pull_ok_at = _last_pull_ok_at(s)
+        rows = s.execute(
+            select(Campaign.id, Campaign.dispatched_at)
+            .where(
+                Campaign.dispatched_at.is_not(None),
+                Campaign.unsubs_confirmed_at.is_(None),
+                Campaign.lock_until.is_not(None),
+                Campaign.lock_until <= func.datetime("now"),
+            )
+        ).mappings().all()
         for r in rows:
             # Require a pull to have completed after this campaign dispatched.
             if not pull_ok_at or pull_ok_at <= (r["dispatched_at"] or ""):
                 continue
-            c.execute(
-                "UPDATE campaigns SET unsubs_confirmed_at = datetime('now') WHERE id = ?",
-                (r["id"],),
+            s.execute(
+                update(Campaign).where(Campaign.id == r["id"])
+                .values(unsubs_confirmed_at=func.datetime("now")).execution_options(synchronize_session=False)
             )
             confirmed += 1
         if confirmed:
-            c.commit()
+            s.commit()
     return confirmed

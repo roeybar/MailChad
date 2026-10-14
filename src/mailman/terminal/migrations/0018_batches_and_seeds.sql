@@ -32,7 +32,7 @@ ALTER TABLE campaign_recipients ADD COLUMN batch_no INTEGER;
 CREATE TABLE IF NOT EXISTS seed_addresses (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   email       TEXT    NOT NULL UNIQUE,
-  provider    TEXT,                              -- 'gmail','outlook','yahoo','icloud','corporate'…
+  provider    TEXT,                              -- 'gmail','outlook','yahoo','icloud','corporate'...
   active      INTEGER NOT NULL DEFAULT 1,
   created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
 );

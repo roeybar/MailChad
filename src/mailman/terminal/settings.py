@@ -13,7 +13,11 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from sqlalchemy import delete as sa_delete, func, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
 from mailman.terminal import db
+from mailman.terminal.models import Setting
 
 log = logging.getLogger("terminal.settings")
 
@@ -107,8 +111,8 @@ def _decrypt(blob_b64: str) -> str:
 
 def _load_plain_cache() -> None:
     global _cache_loaded
-    with db.conn() as c:
-        rows = c.execute("SELECT key, value, is_secret FROM settings").fetchall()
+    with db.session() as s:
+        rows = s.execute(select(Setting.key, Setting.value, Setting.is_secret)).mappings().all()
     _plain_cache.clear()
     for r in rows:
         if not r["is_secret"]:
@@ -122,10 +126,10 @@ def is_secret(key: str) -> bool:
 
 def get(key: str, default: str | None = None) -> str | None:
     secret = is_secret(key)
-    with db.conn() as c:
-        row = c.execute(
-            "SELECT value, is_secret FROM settings WHERE key = ?", (key,)
-        ).fetchone()
+    with db.session() as s:
+        row = s.execute(
+            select(Setting.value, Setting.is_secret).where(Setting.key == key)
+        ).mappings().first()
     if row:
         if secret:
             try:
@@ -153,23 +157,24 @@ def get_int(key: str, default: int) -> int:
 def set(key: str, value: str, updated_by: str = "system") -> None:
     secret_flag = 1 if is_secret(key) else 0
     stored = _encrypt(value) if secret_flag else value
-    with db.conn() as c:
-        c.execute(
-            "INSERT INTO settings (key, value, is_secret, updated_by) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
-            "is_secret=excluded.is_secret, updated_at=datetime('now'), "
-            "updated_by=excluded.updated_by",
-            (key, stored, secret_flag, updated_by),
+    with db.session() as s:
+        stmt = sqlite_insert(Setting).values(key=key, value=stored, is_secret=secret_flag, updated_by=updated_by)
+        s.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[Setting.key],
+                set_={"value": stmt.excluded.value, "is_secret": stmt.excluded.is_secret,
+                      "updated_at": func.datetime("now"), "updated_by": stmt.excluded.updated_by},
+            ).execution_options(synchronize_session=False)
         )
-        c.commit()
+        s.commit()
     if not secret_flag:
         _plain_cache[key] = value
 
 
 def delete(key: str) -> None:
-    with db.conn() as c:
-        c.execute("DELETE FROM settings WHERE key = ?", (key,))
-        c.commit()
+    with db.session() as s:
+        s.execute(sa_delete(Setting).where(Setting.key == key).execution_options(synchronize_session=False))
+        s.commit()
     _plain_cache.pop(key, None)
 
 
@@ -177,8 +182,8 @@ def get_all(*, redact_secrets: bool = True) -> dict[str, str]:
     if not _cache_loaded:
         _load_plain_cache()
     out = dict(_plain_cache)
-    with db.conn() as c:
-        rows = c.execute("SELECT key FROM settings WHERE is_secret = 1").fetchall()
+    with db.session() as s:
+        rows = s.execute(select(Setting.key).where(Setting.is_secret == 1)).mappings().all()
     for r in rows:
         out[r["key"]] = "<encrypted>" if redact_secrets else (get(r["key"]) or "")
     return out
@@ -190,8 +195,8 @@ def migrate_from_env() -> dict[str, str]:
     _load_kek()
     migrated = {}
     for key, env_name in ENV_MIGRATE:
-        with db.conn() as c:
-            existing = c.execute("SELECT 1 FROM settings WHERE key = ?", (key,)).fetchone()
+        with db.session() as s:
+            existing = s.execute(select(1).select_from(Setting).where(Setting.key == key)).first()
         if existing:
             if os.environ.get(env_name):
                 log.info("settings: %s already in DB; env var %s shadowed (safe to remove)",

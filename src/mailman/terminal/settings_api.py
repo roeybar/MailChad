@@ -1,4 +1,4 @@
-"""Terminal settings REST API - session-protected (§Q1 Phase B).
+"""Terminal settings REST API - session-protected (section 12).
 
 Terminal's admin UI calls these to read/write its own settings.
 All routes require a valid operator session (cookie auth).
@@ -12,8 +12,10 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import select
 
 from mailman.terminal import settings, db
+from mailman.terminal.models import Setting
 from mailman.terminal.auth import require_session
 
 log = logging.getLogger("terminal.settings_api")
@@ -29,8 +31,8 @@ def list_settings(session=Depends(require_session)):
 @router.get("/{key}")
 def get_setting(key: str, session=Depends(require_session)):
     if settings.is_secret(key):
-        with db.conn() as c:
-            row = c.execute("SELECT 1 FROM settings WHERE key = ? AND is_secret = 1", (key,)).fetchone()
+        with db.session() as s:
+            row = s.execute(select(1).select_from(Setting).where(Setting.key == key, Setting.is_secret == 1)).first()
         present = bool(row)
         return {"key": key, "is_secret": True, "value": "<encrypted>" if present else None}
     return {"key": key, "is_secret": False, "value": settings.get(key)}

@@ -12,8 +12,7 @@ Algorithm:
 DB_ENCRYPTION_KEY MUST be set in vault env. Backup module never sees plaintext
 or the key; it stores only the ciphertext + manifest entry.
 
-Restore: operator runs `bin/v3 restore <snapshot-id>` which pulls the
-ciphertext, decrypts with the same key, gunzips, writes to vault-db volume.
+Restore snapshots by hand; see Known limitations in the README.
 """
 from __future__ import annotations
 
@@ -23,7 +22,6 @@ import hashlib
 import json
 import logging
 import os
-import sqlite3
 import tempfile
 import uuid
 from datetime import datetime, timezone
@@ -31,8 +29,10 @@ from pathlib import Path
 
 import httpx
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from sqlalchemy import select
 
 from mailman.terminal import db
+from mailman.terminal.models import SuppressionHash
 
 log = logging.getLogger("vault.snapshot")
 
@@ -58,11 +58,9 @@ def _dump_db() -> bytes:
         tmp_path = Path(tmp.name)
     try:
         # SQLite online backup API - consistent snapshot even with writers.
-        src = sqlite3.connect(db.DB_PATH)
-        dst = sqlite3.connect(tmp_path)
-        with dst:
-            src.backup(dst)
-        src.close(); dst.close()
+        with db.driver_connection(db.DB_PATH) as src, db.driver_connection(tmp_path) as dst:
+            with dst:
+                src.backup(dst)
         return gzip.compress(tmp_path.read_bytes())
     finally:
         try:
@@ -128,10 +126,10 @@ async def propagate_erasure(user_hash: str, request_id: str) -> dict:
 
 async def sync_suppression_mirror() -> dict:
     """Push current suppression_hashes to backup mirror."""
-    with db.conn() as c:
-        rows = [dict(r) for r in c.execute(
-            "SELECT email_hash, reason, added_at FROM suppression_hashes"
-        ).fetchall()]
+    with db.session() as s:
+        rows = [dict(r) for r in s.execute(
+            select(SuppressionHash.email_hash, SuppressionHash.reason, SuppressionHash.added_at)
+        ).mappings().all()]
     if not rows:
         return {"synced": 0}
     async with httpx.AsyncClient(timeout=60) as client:

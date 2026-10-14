@@ -1,4 +1,4 @@
--- v3.1 terminal sync tables (§3.3 + §13.4).
+-- v3.1 terminal sync tables.
 --
 -- inbox        - events pulled from cloud, awaiting local materialisation
 -- outbox       - local writes awaiting push to cloud
