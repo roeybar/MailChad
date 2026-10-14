@@ -7,11 +7,11 @@ key to call Resend, then clears the stored encrypted payload on finalisation.
 Webhook and suppression events are encrypted to both terminals' public keys.
 The terminal schedules batches, applies suppression and controls approvals.
 
-![MailMan admin UI](docs/img/login.png)
+![MailMan campaign analytics](docs/img/analytics.png)
 
 [![CI](https://github.com/roeybar/MailMan/actions/workflows/ci.yml/badge.svg)](https://github.com/roeybar/MailMan/actions/workflows/ci.yml)
 
-**Status:** package version 3.24.0. October 2026 test baseline: 645 passed, 1 skipped; AWS and Resend are mocked. The real-send path has not been run against Resend for this release. The admin UI is branded v4; package, API and storage identifiers stay on the v3 line.
+**Status:** package version 4.0.0. October 2026 test baseline: 645 passed, 1 skipped; AWS and Resend are mocked. The real-send path has not been run against Resend for this release. The admin UI is branded v4; API and storage identifiers (ep-v3-*) stay as they are.
 
 **Spec:** [`docs/lambda-dynamo-spec.md`](docs/lambda-dynamo-spec.md)
 
