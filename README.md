@@ -11,6 +11,8 @@ terminals' public keys; one-click unsubscribes are stored and synced as SHA-256
 email hashes. The terminal schedules batches, applies suppression and controls
 approvals.
 
+![MailMan campaign analytics](docs/img/analytics.png)
+
 [![CI](https://github.com/roeybar/MailMan/actions/workflows/ci.yml/badge.svg)](https://github.com/roeybar/MailMan/actions/workflows/ci.yml)
 
 **Status:** package version 4.0.0. October 2026 test baseline: 650 passed, 1
